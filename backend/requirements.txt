@@ -1,0 +1,9 @@
+Flask
+Werkzeug
+openai
+requests
+azure-identity
+python-dotenv
+Pillow
+numpy
+pandas
