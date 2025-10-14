@@ -1,5 +1,9 @@
 # processing.py - Modular file processing service
 import os
+import time
+
+import cv2
+import ffmpeg
 from PIL import Image
 import base64
 import io
@@ -11,6 +15,10 @@ import pandas as pd
 import json
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+from .speech_service import transcribe_audio_file
+
 
 def process_files(file_paths, file_type, output_formats=None, description=None):
     if output_formats is None:
@@ -157,14 +165,34 @@ def process_image_files(file_paths, output_formats, description=None):
         'feature_specification': feature_prompt
     }
 
-# Example video file processing
 def process_video_files(file_paths, output_formats, description):
-    # Placeholder: implement video analysis, transcoding, etc.
+    video_path = file_paths[0]
+
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    temp_audio_path = os.path.join('uploads', f"temp_{base_name}_{int(time.time())}.wav")
+
+    try:
+        ffmpeg.input(video_path).output(
+            temp_audio_path,
+            acodec='pcm_s16le',
+            ac=1,
+            ar='16k'
+        ).run(quiet=True, overwrite_output=True)
+    except ffmpeg.Error:
+        return {'status': 'error', 'message': 'Failed to extract audio from video.'}
+
+    transcript = transcribe_audio_file(temp_audio_path, model_choice='fast')
+
+    try:
+        os.remove(temp_audio_path)
+    except OSError:
+        pass
+
     return {
         'status': 'processed',
         'type': 'video',
-        'files': file_paths,
-        'output_formats': output_formats,
+        'original_file': video_path,
+        'transcription': transcript,
         'description': description
     }
 
@@ -177,3 +205,48 @@ def select_representative_images(image_arrays, sample_size=20):
     if len(image_arrays) <= sample_size:
         return image_arrays
     return random.sample(image_arrays, sample_size)
+
+
+def extract_key_frames(video_path, frame_limit=8, sharpness_threshold=100.0):
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print(f"Error: Could not open video: {video_path}")
+        return []
+
+    candidates = []
+    frame_skip = 15
+    frame_count = 0
+    prev_gray_frame = None
+
+    while True:
+        is_read, frame = cap.read()
+        if not is_read:
+            break
+
+        frame_count += 1
+        if frame_count % frame_skip != 0:
+            continue
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness_score = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
+
+        if sharpness_score < sharpness_threshold:
+            continue
+
+        change_score = 0
+        if prev_gray_frame is not None:
+            diff = cv2.absdiff(prev_gray_frame, gray_frame)
+            change_score = int(diff.sum())
+
+        candidates.append((change_score, frame))
+        prev_gray_frame = gray_frame
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    top_frames_data = candidates[:frame_limit]
+
+    key_frames = [frame for score, frame in top_frames_data]
+
+    cap.release()
+    return key_frames
