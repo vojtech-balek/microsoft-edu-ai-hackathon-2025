@@ -9,15 +9,15 @@ import base64
 import io
 import numpy as np
 from string import Template
-from .openai_service import extract_image_features_with_llm
+from .openai_service import extract_image_features_with_llm, extract_text_features_with_llm
 import random
 import pandas as pd
 import json
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import PyPDF2
 
-
-from .speech_service import transcribe_audio_file
+from .speech_service import transcribe_video_file
 
 
 def process_files(file_paths, file_type, output_formats=None, description=None):
@@ -35,14 +35,79 @@ def process_files(file_paths, file_type, output_formats=None, description=None):
     return result
 
 # Example text file processing (PDF)
-def process_text_files(file_paths, output_formats, description):
-    # Placeholder: implement PDF parsing, text extraction, etc.
+def process_text_files(file_paths, output_formats, description, target=None):
+    # Step 1: Extract text layer from each PDF file
+    extracted_texts = {}
+    for file_path in file_paths:
+        try:
+            with open(file_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                text = ''
+                for page in reader.pages:
+                    text += page.extract_text() or ''
+            filename = os.path.basename(file_path)
+            extracted_texts[filename] = text
+        except Exception as e:
+            extracted_texts[os.path.basename(file_path)] = f'<error extracting text: {e}>'
+    # Step 2: Select representative texts
+    texts_list = list(extracted_texts.values())
+    rep_texts = select_representative_images(texts_list, sample_size=1)  # reuse sampling logic
+    # Step 3: Build prompt for feature discovery
+    dataset_name = "Text Dataset"
+    target = target or "<target>"
+    examples_str = '\n---\n'.join(rep_texts)
+    prompt = prompt_template.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
+    # Step 4: Feature extraction using LLM
+    feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
+    print(f"{feature_spec = }")
+    feature_prompt = str(feature_spec[0])
+    # Step 5: Feature generation for all texts (parallel)
+    def extract_single(text):
+        return extract_text_features_with_llm([text], prompt=feature_prompt, feature_gen=True)
+    all_features = []
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(extract_single, text) for text in texts_list]
+        for future in as_completed(futures):
+            all_features.append(future.result())
+    all_features = [future.result() for future in futures]
+    # Step 6: Output tabular dataset
+    tabular_output = {}
+    for filename, features in zip(extracted_texts.keys(), all_features):
+        tabular_output[filename] = features
+
+    # Step 7: Postprocess according to output_formats
+    output_data = {}
+    if not output_formats:
+        output_formats = ['json']
+    for fmt in output_formats:
+        fmt = fmt.lower()
+        df = pd.DataFrame([v[0] for v in tabular_output.values()], index=tabular_output.keys())
+        if fmt == 'json':
+            output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
+        elif fmt == 'csv':
+            output_data['csv'] = df.to_csv()
+            df.to_csv('test.csv')
+        elif fmt == 'xlsx':
+            xlsx_buffer = BytesIO()
+            df.to_excel(xlsx_buffer)
+            xlsx_buffer.seek(0)
+            output_data['xlsx'] = xlsx_buffer.read()
+        elif fmt == 'xml':
+            try:
+                output_data['xml'] = df.to_xml(root_name='dataset')
+            except Exception:
+                output_data['xml'] = '<error>XML export failed</error>'
+        else:
+            output_data[fmt] = f'<error>Unsupported format: {fmt}</error>'
     return {
         'status': 'processed',
         'type': 'text',
         'files': file_paths,
         'output_formats': output_formats,
-        'description': description
+        'description': description,
+        'tabular_output': tabular_output,
+        'outputs': output_data,
+        'feature_specification': feature_prompt
     }
 
 # Universal prompt template for image feature discovery
@@ -59,7 +124,7 @@ image_prompt_template = Template("""
             "Analyze the provided metadata and representative images to determine the domain and context of the dataset.",
             "Identify key visual characteristics relevant to feature extraction.",
             "List potential high-level categorical and numerical features based on domain knowledge and image content.",
-            "Extract at least 10 distinct features from the representative images.",
+            "Extract at least 20 distinct features from the representative images.",
             "For each identified feature, provide a clear name, description, possible values, and a specific LLM extraction query."
         ],
         "constraints": [
@@ -117,14 +182,16 @@ def process_image_files(file_paths, output_formats, description=None):
     def extract_single(img_b64):
         return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
     all_features = []
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
-        for future in as_completed(futures):
-            all_features.append(future.result())
-    # Preserve original order (already preserved by futures list)
-    all_features = [future.result() for future in futures]
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        print("inside threadpool")
+        future_map = {executor.submit(extract_single, img_b64): img_b64 for img_b64 in image_base64_list}
+
+        results_map = {future_map[future]: future.result() for future in as_completed(future_map)}
+
+        all_features = [results_map[img_b64] for img_b64 in image_base64_list]
     # Step 6: Output tabular dataset
     # Map each set of features to its corresponding image filename
+    print("before tabular")
     tabular_output = {}
     for file_path, features in zip(file_paths, all_features):
         filename = os.path.basename(file_path)
@@ -167,34 +234,33 @@ def process_image_files(file_paths, output_formats, description=None):
 
 def process_video_files(file_paths, output_formats, description):
     video_path = file_paths[0]
-
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
-    temp_audio_path = os.path.join('uploads', f"temp_{base_name}_{int(time.time())}.wav")
-
+    key_frame_paths = []
+    print("processing video")
     try:
-        ffmpeg.input(video_path).output(
-            temp_audio_path,
-            acodec='pcm_s16le',
-            ac=1,
-            ar='16k'
-        ).run(quiet=True, overwrite_output=True)
-    except ffmpeg.Error:
-        return {'status': 'error', 'message': 'Failed to extract audio from video.'}
+        print("extracting key frames")
+        key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
+        print("key frames done")
+        if not key_frame_arrays:
+            return {'status': 'error', 'message': 'No key frames found in video.'}
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        for i, frame in enumerate(key_frame_arrays):
+            path = os.path.join('uploads', f"{base_name}_keyframe_{i}.jpg")
+            cv2.imwrite(path, frame)
+            key_frame_paths.append(path)
+        image_pipeline_result = process_image_files(key_frame_paths, output_formats, description)
 
-    transcript = transcribe_audio_file(temp_audio_path, model_choice='fast')
-
-    try:
-        os.remove(temp_audio_path)
-    except OSError:
-        pass
-
-    return {
-        'status': 'processed',
-        'type': 'video',
-        'original_file': video_path,
-        'transcription': transcript,
-        'description': description
-    }
+        final_result = {
+            'status': 'processed',
+            'type': 'video',
+            'original_file': video_path,
+            'description': description,
+            'key_frame_analysis': image_pipeline_result
+        }
+        return final_result
+    finally:
+        for path in key_frame_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 def select_representative_images(image_arrays, sample_size=20):
     """
@@ -250,3 +316,68 @@ def extract_key_frames(video_path, frame_limit=8, sharpness_threshold=100.0):
 
     cap.release()
     return key_frames
+
+def resize_with_padding(image, target_size=(1024, 1024), background_color="black"):
+    image.thumbnail(target_size)
+
+    new_image = Image.new("RGB", target_size, background_color)
+
+    left = (target_size[0] - image.width) // 2
+    top = (target_size[1] - image.height) // 2
+
+    new_image.paste(image, (left, top))
+
+    return new_image
+
+# Universal prompt template for text feature extraction
+prompt_template = Template("""
+{
+    "system_message": "IMPORTANT: Return only a valid JSON object with no explanations, text, or markdown!!! Do not include any commentary or introductory text!!!",
+    "input_metadata": {
+        "dataset_name": "$name",
+        "description": "$description",
+        "target": "$target",
+        "examples": "$examples"
+    },
+    "task": {
+        "steps": [
+            "Analyze the provided metadata and examples to determine the domain and context of the dataset.",
+            "Identify the key characteristics of the dataset relevant to predicting the target variable.",
+            "Extract at least 20 distinct features from the representative images.",
+            "Based on provided examples, try to generalize on the domain",
+            "List potential high-level categorical and numerical features based on domain knowledge inferred from the dataset description.",
+            "Extract additional potential features from dataset examples using syntactic and semantic patterns, ensuring at least 20 distinct features are generated.",
+            "If the text implies certain values that match the target, these values may also be extracted as features. In cases where the target has multiple values, each value can be independently derived from the text as a feature if it is contextually appropriate.",
+            "For text-based datasets, identify key phrases, structural components, and linguistic patterns that are relevant.",
+            "For numerical datasets, identify aggregation patterns, distributional characteristics, and possible transformations.",
+            "Group related features into meaningful categories where applicable.",
+            "If a feature has more than 15 unique categories, group less frequent categories into an 'Other' class.",
+            "For each identified feature, provide a clear name, description, a complete list of possible values, and a specific LLM extraction query."
+        ],
+        "constraints": [
+            "Ensure features are distinct and non-redundant.",
+            "Note that the target variable is not explicitly present in the input text.",
+            "Prioritize domain-specific insights over generic ones.",
+            "Ensure output is a structured, valid JSON format.",
+            "For categorical variables, list possible values with domain justification.",
+            "For numeric variables, provide possible transformations (e.g., log, mean differences).",
+            "The extraction queries must be specific and detailed to ensure high-quality feature generation.",
+            "Tailor extraction queries to the domain context of the dataset.",
+            "Generate a diverse set of features to maximize potential predictive power."
+        ]
+    },
+    "output_format": {
+        "type": "json",
+        "structure": {
+            "features": [
+                {
+                    "feature_name": "<Name of the categorical or numerical feature>",
+                    "description": "<Short description of what the feature represents and how it relates to the dataset's context>",
+                    "possible_values": ["<Value 1>", "<Value 2>", "...", "<Value n>"],
+                    "extraction_query": "Identify the '<feature_name>' based on the provided context. Options: '<Value 1>', '<Value 2>', ..., '<Value n>'."
+                }
+            ]
+        }
+    }
+}
+""")

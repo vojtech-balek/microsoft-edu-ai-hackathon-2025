@@ -67,3 +67,59 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
                 features_list.append({"error": str(e)})
                 break
     return features_list
+
+def extract_text_features_with_llm(text_list, prompt=None, deployment_name=None, feature_gen = False) -> list:
+    features_list = []
+    for text in text_list:
+        if prompt is None:
+            prompt_text = "Extract meaningful features from this text for tabular dataset construction."
+        else:
+            prompt_text = prompt
+        if deployment_name is None:
+            deployment_name = os.getenv("AZURE_OPENAI_GPT41_DEPLOYMENT_NAME")
+        max_retries = 5
+        backoff = 2
+        if feature_gen:
+            prompt_text = """You are a feature extraction assistant for text documents. 
+                        You provide output in a structured JSON format and do NOT provide any explanations.
+                        {
+                          "<feature1_name>": "<value1>",
+                          "<feature2_name>": "<value2>",
+                          "<feature3_name>": "<value3>",
+                          "<feature4_name>": "<value4>",
+                          "<feature5_name>": "<value5>"
+                        }""" + "In case more than 1 value applies to the selected feature, pick the most important.\n" + "GENERATE ALL PRESENTED FEATURES!\n"+ prompt
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model=deployment_name,
+                    messages=[
+                        {"role": "system", "content": prompt_text
+                         },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": text}
+                            ]
+                        }
+                    ],
+                    max_tokens=2048,
+                    temperature=0.0
+                )
+                content = response.choices[0].message.content
+                try:
+                    features = json.loads(content)
+                except Exception:
+                    features = {"features": content}
+                features_list.append(features)
+                break
+            except openai.RateLimitError:
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    features_list.append({"error": "Rate limit exceeded. Please try again later."})
+            except Exception as e:
+                features_list.append({"error": str(e)})
+                break
+    return features_list
