@@ -88,7 +88,7 @@ def extract_text_features_with_llm(text_list, prompt=None, deployment_name=None,
                           "<feature3_name>": "<value3>",
                           "<feature4_name>": "<value4>",
                           "<feature5_name>": "<value5>"
-                        }""" + prompt
+                        }""" + "In case more than 1 value applies to the selected feature, pick the most important.\n" + "GENERATE ALL PRESENTED FEATURES!\n"+ prompt
         for attempt in range(max_retries):
             try:
                 response = client.chat.completions.create(
@@ -103,7 +103,7 @@ def extract_text_features_with_llm(text_list, prompt=None, deployment_name=None,
                             ]
                         }
                     ],
-                    max_tokens=512,
+                    max_tokens=2048,
                     temperature=0.0
                 )
                 content = response.choices[0].message.content
