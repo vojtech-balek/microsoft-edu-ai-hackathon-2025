@@ -73,26 +73,26 @@ def process_text_files(file_paths, output_formats, description, target=None):
     tabular_output = {}
     for filename, features in zip(extracted_texts.keys(), all_features):
         tabular_output[filename] = features
+
     # Step 7: Postprocess according to output_formats
     output_data = {}
     if not output_formats:
         output_formats = ['json']
     for fmt in output_formats:
         fmt = fmt.lower()
+        df = pd.DataFrame([v[0] for v in tabular_output.values()], index=tabular_output.keys())
         if fmt == 'json':
             output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
         elif fmt == 'csv':
-            df = pd.DataFrame.from_dict(tabular_output, orient='index')
             output_data['csv'] = df.to_csv()
+            df.to_csv('test.csv')
         elif fmt == 'xlsx':
-            df = pd.DataFrame.from_dict(tabular_output, orient='index')
             xlsx_buffer = BytesIO()
             df.to_excel(xlsx_buffer)
             xlsx_buffer.seek(0)
             output_data['xlsx'] = xlsx_buffer.read()
         elif fmt == 'xml':
             try:
-                df = pd.DataFrame.from_dict(tabular_output, orient='index')
                 output_data['xml'] = df.to_xml(root_name='dataset')
             except Exception:
                 output_data['xml'] = '<error>XML export failed</error>'
@@ -330,6 +330,7 @@ prompt_template = Template("""
             "Analyze the provided metadata and examples to determine the domain and context of the dataset.",
             "Identify the key characteristics of the dataset relevant to predicting the target variable.",
             "Extract at least 20 distinct features from the representative images.",
+            "Based on provided examples, try to generalize on the domain",
             "List potential high-level categorical and numerical features based on domain knowledge inferred from the dataset description.",
             "Extract additional potential features from dataset examples using syntactic and semantic patterns, ensuring at least 20 distinct features are generated.",
             "If the text implies certain values that match the target, these values may also be extracted as features. In cases where the target has multiple values, each value can be independently derived from the text as a feature if it is contextually appropriate.",
