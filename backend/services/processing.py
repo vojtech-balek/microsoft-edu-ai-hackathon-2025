@@ -42,6 +42,7 @@ def process_text_files(file_paths, output_formats, description, target=None):
         try:
             with open(file_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
+                #TODO if summary
                 text = ''
                 for page in reader.pages:
                     text += page.extract_text() or ''
@@ -232,35 +233,123 @@ def process_image_files(file_paths, output_formats, description=None):
         'feature_specification': feature_prompt
     }
 
-def process_video_files(file_paths, output_formats, description):
-    video_path = file_paths[0]
-    key_frame_paths = []
-    print("processing video")
-    try:
-        print("extracting key frames")
-        key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
-        print("key frames done")
-        if not key_frame_arrays:
-            return {'status': 'error', 'message': 'No key frames found in video.'}
-        base_name = os.path.splitext(os.path.basename(video_path))[0]
-        for i, frame in enumerate(key_frame_arrays):
-            path = os.path.join('uploads', f"{base_name}_keyframe_{i}.jpg")
-            cv2.imwrite(path, frame)
-            key_frame_paths.append(path)
-        image_pipeline_result = process_image_files(key_frame_paths, output_formats, description)
 
-        final_result = {
-            'status': 'processed',
-            'type': 'video',
-            'original_file': video_path,
-            'description': description,
-            'key_frame_analysis': image_pipeline_result
-        }
-        return final_result
-    finally:
-        for path in key_frame_paths:
-            if os.path.exists(path):
-                os.remove(path)
+def process_video_files(file_paths, output_formats, description):
+    consolidated_tabular_output = {}
+    feature_spec_from_text = None
+    all_transcripts = {}
+    all_summaries = {}
+
+    for video_path in file_paths:
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        temp_summary_path = None
+
+        try:
+            transcript = transcribe_video_file(video_path)
+            all_transcripts[os.path.basename(video_path)] = transcript
+
+            key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
+            if not key_frame_arrays:
+                consolidated_tabular_output[os.path.basename(video_path)] = {"error": "No key frames found."}
+                all_summaries[os.path.basename(video_path)] = ""
+                continue
+
+            frame_b64_list = []
+            for frame in key_frame_arrays:
+                if isinstance(frame, np.ndarray):
+                    if frame.ndim == 3 and frame.shape[2] == 3:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    else:
+                        frame_rgb = frame
+                    pil_image = Image.fromarray(frame_rgb.astype('uint8'), 'RGB')
+                else:
+                    pil_image = frame
+
+                buffered = io.BytesIO()
+                pil_image.save(buffered, format="JPEG")
+                frame_b64 = base64.b64encode(buffered.getvalue()).decode()
+                frame_b64_list.append(frame_b64)
+
+            summary_prompt = (
+                "You are an expert video analyst with deep knowledge in multimodal understanding (audio + visual). "
+                "Your task is to produce an exceptionally detailed, comprehensive, and structured summary of the provided file. "
+                "Use BOTH the full transcript AND the key visual frames to create a rich, insightful analysis. "
+                "Do NOT be brief. Write a long, thorough summary (at least 300–500 words) that could serve as a standalone document "
+                "for someone who has not seen the video.\n\n"
+
+                "Structure your response as follows:\n"
+                "1. **Context & Purpose**: What is the video about? Who is the audience? What is its goal (educational, promotional, documentary, etc.)?\n"
+                "2. **Narrative & Key Topics**: Walk through the main ideas in order. What arguments, explanations, or stories are presented? Include specific examples or quotes if relevant.\n"
+                "3. **Visual Analysis**: Describe important visual elements from the frames (e.g., people, settings, on-screen text, diagrams, actions, emotions, scene changes). How do they support or expand the spoken content?\n"
+                "4. **Key Takeaways**: What are the 3–5 most important insights, conclusions, or messages?\n"
+                "5. **Overall Tone & Style**: Is the video formal, casual, urgent, humorous, technical? How does this affect the message?\n\n"
+
+                "Be precise, analytical, and exhaustive. If the transcript is in Czech, respond in Czech. "
+                "If it's in English, respond in English. Match the language of the transcript.\n\n"
+
+                f"Transcript:\n{transcript}"
+            )
+            video_summary = extract_image_features_with_llm(frame_b64_list, prompt=summary_prompt)
+            print(video_summary)
+            if not isinstance(video_summary, str):
+                video_summary = str(video_summary)
+
+            all_summaries[os.path.basename(video_path)] = video_summary
+
+            os.makedirs('uploads', exist_ok=True)
+            temp_summary_path = os.path.join('uploads', f"summary_{base_name}.txt")
+            with open(temp_summary_path, 'w', encoding='utf-8') as f:
+                f.write(video_summary)
+
+            single_video_result = process_text_files([temp_summary_path], output_formats, description)
+            summary_filename = os.path.basename(temp_summary_path)
+            if single_video_result.get('tabular_output', {}).get(summary_filename):
+                consolidated_tabular_output[os.path.basename(video_path)] = single_video_result['tabular_output'][summary_filename]
+            feature_spec_from_text = single_video_result.get('feature_specification')
+
+        finally:
+            if temp_summary_path and os.path.exists(temp_summary_path):
+                os.remove(temp_summary_path)
+
+    output_data = {}
+    if not output_formats:
+        output_formats = ['json']
+
+    for fmt in output_formats:
+        fmt = fmt.lower()
+        if fmt == 'json':
+            output_data['json'] = json.dumps(consolidated_tabular_output, ensure_ascii=False, indent=2)
+        elif consolidated_tabular_output:
+            df = pd.DataFrame.from_dict(consolidated_tabular_output, orient='index')
+            if not df.empty and isinstance(df.iloc[0, 0], list) and len(df.iloc[0, 0]) == 1:
+                df = df.applymap(lambda x: x[0] if isinstance(x, list) and len(x) == 1 else x)
+
+            if fmt == 'csv':
+                output_data['csv'] = df.to_csv()
+            elif fmt == 'xlsx':
+                xlsx_buffer = BytesIO()
+                df.to_excel(xlsx_buffer, index=True)
+                xlsx_buffer.seek(0)
+                output_data['xlsx'] = xlsx_buffer.read()
+            elif fmt == 'xml':
+                try:
+                    output_data['xml'] = df.to_xml(root_name='dataset')
+                except Exception:
+                    output_data['xml'] = '<error>XML export failed</error>'
+
+
+    return {
+        'status': 'processed',
+        'type': 'video',
+        'original_files': file_paths,
+        'output_formats': output_formats,
+        'description': description,
+        'tabular_output': consolidated_tabular_output,
+        'outputs': output_data,
+        'feature_specification': feature_spec_from_text,
+        'transcripts': all_transcripts,
+        'summaries': all_summaries
+    }
 
 def select_representative_images(image_arrays, sample_size=20):
     """
@@ -381,3 +470,31 @@ prompt_template = Template("""
     }
 }
 """)
+
+
+def create_collage(image_arrays, collage_width=1024):
+    if not image_arrays:
+        return None
+
+    target_height = collage_width // len(image_arrays)
+    pil_images = []
+    total_width = 0
+    for frame in image_arrays:
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img_rgb)
+
+        ratio = target_height / img.height
+        new_width = int(img.width * ratio)
+        img = img.resize((new_width, target_height), Image.LANCZOS)
+
+        pil_images.append(img)
+        total_width += new_width
+
+    collage = Image.new('RGB', (total_width, target_height))
+
+    current_x = 0
+    for img in pil_images:
+        collage.paste(img, (current_x, 0))
+        current_x += img.width
+
+    return collage
