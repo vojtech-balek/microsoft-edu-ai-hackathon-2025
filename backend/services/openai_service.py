@@ -22,17 +22,26 @@ def image_to_base64(img_arr):
     img.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode()
 
-def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_name=None) -> list:
+def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_name=None, feature_gen=False) -> list:
     features_list = []
+
     for img_b64 in image_base64_list:
         if prompt is None:
             prompt_text = "Extract meaningful features from this image for tabular dataset construction."
         else:
             prompt_text = prompt
+        user_content = [
+            {"type": "text", "text": prompt_text}
+        ]
         if deployment_name is None:
             deployment_name = os.getenv("AZURE_OPENAI_GPT41_DEPLOYMENT_NAME")
         max_retries = 5
         backoff = 2
+        if not feature_gen:
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+            })
         for attempt in range(max_retries):
             try:
                 response = client.chat.completions.create(
@@ -41,10 +50,7 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
                         {"role": "system", "content": "You are a feature extraction assistant for images."},
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                            ]
+                            "content": user_content
                         }
                     ],
                     max_tokens=512,
