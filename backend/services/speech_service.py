@@ -1,49 +1,56 @@
 import os
+import requests
 from typing import Literal
-
-import azure.cognitiveservices.speech as speechsdk
 from dotenv import load_dotenv
 
 load_dotenv()
 
-SPEECH_API_KEY = os.getenv("SPEECH_AZURE_OPENAI_API_KEY")
-SPEECH_REGION = os.getenv("SPEECH_AZURE_REGION")
-HIGH_QUALITY_MODEL_NAME = os.getenv("MEGATHINK_TRANSCRIBE_HIGH_QUALITY")
-FAST_MODEL_NAME = os.getenv("MEGATHINK_TRANSCRIBE_FAST")
+def transcribe_audio_file(audio_file_path: str, model_choice: Literal["high_quality", "fast"] = "fast") -> str:
+    endpoint = os.getenv("SPEECH_AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("SPEECH_AZURE_OPENAI_API_KEY")
+    api_version = os.getenv("SPEECH_AZURE_OPENAI_API_VERSION")
 
-ENDPOINT = f"wss://{SPEECH_REGION}.stt.speech.microsoft.com/speech/universal/v2" if SPEECH_REGION else None
+    if not endpoint or not api_key:
+        return "Speech service is not configured."
 
+    deployment = (
+        os.getenv("SPEECH_GPT4O_TRANSCRIBE_DEPLOYMENT_NAME")
+        if model_choice == "high_quality"
+        else os.getenv("SPEECH_GPT4O_MINI_TRANSCRIBE_DEPLOYMENT_NAME")
+    )
 
-def transcribe_audio_file(
-    audio_file_path: str, model_choice: Literal["high_quality", "fast"] = "fast"
-) -> str:
-    if not audio_file_path or not os.path.exists(audio_file_path):
-        return "Audio file not found."
+    if not deployment:
+        return f"Deployment for '{model_choice}' not found."
 
-    if not SPEECH_API_KEY or not SPEECH_REGION:
-        return "Missing Azure Speech configuration: SPEECH_AZURE_OPENAI_API_KEY or SPEECH_AZURE_REGION."
+    if not os.path.exists(audio_file_path):
+        return f"File not found: {audio_file_path}"
 
-    deployment_name = FAST_MODEL_NAME if model_choice == "fast" else HIGH_QUALITY_MODEL_NAME
-    if not deployment_name:
-        return "Missing deployment name for the selected model."
+    lower_case_path = audio_file_path.lower()
+
+    if lower_case_path.endswith(".mp4") or lower_case_path.endswith(".m4a"):
+        content_type = "audio/mp4"
+    elif lower_case_path.endswith(".mp3") or lower_case_path.endswith(".mpeg"):
+        content_type = "audio/mpeg"
+    elif lower_case_path.endswith(".wav"):
+        content_type = "audio/wav"
+    else:
+        content_type = "application/octet-stream"
 
     try:
-        speech_config = speechsdk.SpeechConfig(subscription=SPEECH_API_KEY, endpoint=ENDPOINT)
-        speech_config.set_property(speechsdk.PropertyId.SpeechServiceConnection_EndpointId, deployment_name)
+        url = f"{endpoint}openai/deployments/{deployment}/audio/transcriptions?api-version={api_version}"
+        with open(audio_file_path, "rb") as f:
+            response = requests.post(
+                url,
+                headers={"api-key": api_key},
+                files={"file": (os.path.basename(audio_file_path), f, content_type)},
+                data={"model": "gpt-4o-transcribe", "response_format": "json"},
+                timeout=300,
+            )
 
-        audio_config = speechsdk.audio.AudioConfig(filename=audio_file_path)
-        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+        if response.status_code != 200:
+            return f"Transcription failed ({response.status_code}): {response.text}"
 
-        result = recognizer.recognize_once()
+        return response.json().get("text", "(no text found)")
 
-        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            return result.text or ""
-        if result.reason == speechsdk.ResultReason.NoMatch:
-            return "No speech could be recognized."
-        if result.reason == speechsdk.ResultReason.Canceled:
-            details = result.cancellation_details
-            return f"Transcription canceled: {details.reason}. Error: {details.error_details}"
-
-        return "Unknown transcription result."
     except Exception as e:
-        return f"An exception occurred: {e}"
+        return f"Error: {e}"
