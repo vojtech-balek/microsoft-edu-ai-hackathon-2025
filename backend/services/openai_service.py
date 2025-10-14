@@ -22,7 +22,7 @@ def image_to_base64(img_arr):
     img.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode()
 
-def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_name=None):
+def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_name=None) -> list:
     features_list = []
     for img_b64 in image_base64_list:
         if prompt is None:
@@ -47,7 +47,8 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
                             ]
                         }
                     ],
-                    max_tokens=512
+                    max_tokens=512,
+                    temperature=0.0
                 )
                 content = response.choices[0].message.content
                 try:
@@ -65,6 +66,4 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
             except Exception as e:
                 features_list.append({"error": str(e)})
                 break
-    if len(features_list) == 1:
-        return features_list[0]
     return features_list
