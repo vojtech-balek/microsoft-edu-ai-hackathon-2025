@@ -57,7 +57,9 @@ image_prompt_template = Template("""
         "constraints": [
             "Ensure features are distinct and non-redundant.",
             "Prioritize domain-specific insights over generic ones.",
-            "Ensure output is a structured, valid JSON format."
+            "Ensure output is a structured, valid JSON format.",
+            "Tailor extraction queries to the domain context of the dataset.",
+            "Generate a diverse set of features to maximize potential predictive power."
         ]
     },
     "output_format": {
@@ -100,12 +102,9 @@ def process_image_files(file_paths, output_formats, description=None):
     # Step 4: Feature extraction using multimodal LLM
     feature_spec = extract_image_features_with_llm(rep_images, prompt=prompt)
     # Ensure feature_spec is a dict and get features for prompt
-    if isinstance(feature_spec, dict) and 'features' in feature_spec:
-        feature_prompt = json.dumps(feature_spec['features'])
-    elif isinstance(feature_spec, list) and len(feature_spec) > 0:
-        feature_prompt = str(feature_spec[0])
-    else:
-        feature_prompt = str(feature_spec)
+
+    feature_prompt = str(feature_spec[0])
+
     # Step 5: Feature generation for all images (parallel)
     def extract_single(img_b64):
         return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
@@ -114,11 +113,14 @@ def process_image_files(file_paths, output_formats, description=None):
         futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
         for future in as_completed(futures):
             all_features.append(future.result())
-    # Preserve original order
+    # Preserve original order (already preserved by futures list)
     all_features = [future.result() for future in futures]
     # Step 6: Output tabular dataset
-    df = pd.DataFrame(all_features)
-    tabular_output = df.to_dict(orient='records')
+    # Map each set of features to its corresponding image filename
+    tabular_output = {}
+    for file_path, features in zip(file_paths, all_features):
+        filename = os.path.basename(file_path)
+        tabular_output[filename] = features
     # Step 7: Postprocess according to output_formats
     output_data = {}
     if not output_formats:
@@ -128,15 +130,18 @@ def process_image_files(file_paths, output_formats, description=None):
         if fmt == 'json':
             output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
         elif fmt == 'csv':
-            output_data['csv'] = df.to_csv(index=False)
+            df = pd.DataFrame.from_dict(tabular_output, orient='index')
+            output_data['csv'] = df.to_csv()
         elif fmt == 'xlsx':
+            df = pd.DataFrame.from_dict(tabular_output, orient='index')
             xlsx_buffer = BytesIO()
-            df.to_excel(xlsx_buffer, index=False)
+            df.to_excel(xlsx_buffer)
             xlsx_buffer.seek(0)
             output_data['xlsx'] = xlsx_buffer.read()
         elif fmt == 'xml':
             try:
-                output_data['xml'] = df.to_xml(root_name='dataset', index=False)
+                df = pd.DataFrame.from_dict(tabular_output, orient='index')
+                output_data['xml'] = df.to_xml(root_name='dataset')
             except Exception:
                 output_data['xml'] = '<error>XML export failed</error>'
         else:
@@ -148,7 +153,8 @@ def process_image_files(file_paths, output_formats, description=None):
         'output_formats': output_formats,
         'description': description,
         'tabular_output': tabular_output,
-        'outputs': output_data
+        'outputs': output_data,
+        'feature_specification': feature_prompt
     }
 
 # Example video file processing
@@ -162,7 +168,7 @@ def process_video_files(file_paths, output_formats, description):
         'description': description
     }
 
-def select_representative_images(image_arrays, sample_size=5):
+def select_representative_images(image_arrays, sample_size=20):
     """
     Select a representative sample of images from the dataset.
     Uses random sampling if the dataset is larger than sample_size.
