@@ -6,6 +6,7 @@ import ffmpeg
 from PIL import Image
 import base64
 import io
+import numpy as np
 from string import Template
 from .openai_service import extract_image_features_with_llm, extract_text_features_with_llm
 import random
@@ -15,7 +16,6 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import PyPDF2
 from .speech_service import transcribe_audio_file
-
 
 def process_files(file_paths, file_type, output_formats=None, description=None):
     if output_formats is None:
@@ -215,34 +215,33 @@ def process_image_files(file_paths, output_formats, description=None):
 
 def process_video_files(file_paths, output_formats, description):
     video_path = file_paths[0]
-
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
-    temp_audio_path = os.path.join('uploads', f"temp_{base_name}_{int(time.time())}.wav")
-
+    key_frame_paths = []
+    print("processing video")
     try:
-        ffmpeg.input(video_path).output(
-            temp_audio_path,
-            acodec='pcm_s16le',
-            ac=1,
-            ar='16k'
-        ).run(quiet=True, overwrite_output=True)
-    except ffmpeg.Error:
-        return {'status': 'error', 'message': 'Failed to extract audio from video.'}
+        print("extracting key frames")
+        key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
+        print("key frames done")
+        if not key_frame_arrays:
+            return {'status': 'error', 'message': 'No key frames found in video.'}
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        for i, frame in enumerate(key_frame_arrays):
+            path = os.path.join('uploads', f"{base_name}_keyframe_{i}.jpg")
+            cv2.imwrite(path, frame)
+            key_frame_paths.append(path)
+        image_pipeline_result = process_image_files(key_frame_paths, output_formats, description)
 
-    transcript = transcribe_audio_file(temp_audio_path, model_choice='fast')
-
-    try:
-        os.remove(temp_audio_path)
-    except OSError:
-        pass
-
-    return {
-        'status': 'processed',
-        'type': 'video',
-        'original_file': video_path,
-        'transcription': transcript,
-        'description': description
-    }
+        final_result = {
+            'status': 'processed',
+            'type': 'video',
+            'original_file': video_path,
+            'description': description,
+            'key_frame_analysis': image_pipeline_result
+        }
+        return final_result
+    finally:
+        for path in key_frame_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 def select_representative_images(image_arrays, sample_size=20):
     """
@@ -298,6 +297,18 @@ def extract_key_frames(video_path, frame_limit=8, sharpness_threshold=100.0):
 
     cap.release()
     return key_frames
+
+def resize_with_padding(image, target_size=(1024, 1024), background_color="black"):
+    image.thumbnail(target_size)
+
+    new_image = Image.new("RGB", target_size, background_color)
+
+    left = (target_size[0] - image.width) // 2
+    top = (target_size[1] - image.height) // 2
+
+    new_image.paste(image, (left, top))
+
+    return new_image
 
 # Universal prompt template for text feature extraction
 prompt_template = Template("""
