@@ -9,6 +9,9 @@ from .openai_service import extract_image_features_with_llm
 import random
 import pandas as pd
 import json
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def process_files(file_paths, file_type, output_formats=None, description=None):
     if output_formats is None:
         output_formats = []
@@ -103,21 +106,49 @@ def process_image_files(file_paths, output_formats, description=None):
         feature_prompt = str(feature_spec[0])
     else:
         feature_prompt = str(feature_spec)
-    # Step 5: Feature generation for all images
+    # Step 5: Feature generation for all images (parallel)
+    def extract_single(img_b64):
+        return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
     all_features = []
-    for img_b64 in image_base64_list:
-        features = extract_image_features_with_llm([img_b64], prompt=feature_prompt)
-        all_features.append(features)
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
+        for future in as_completed(futures):
+            all_features.append(future.result())
+    # Preserve original order
+    all_features = [future.result() for future in futures]
     # Step 6: Output tabular dataset
     df = pd.DataFrame(all_features)
     tabular_output = df.to_dict(orient='records')
+    # Step 7: Postprocess according to output_formats
+    output_data = {}
+    if not output_formats:
+        output_formats = ['json']  # Default to JSON if none specified
+    for fmt in output_formats:
+        fmt = fmt.lower()
+        if fmt == 'json':
+            output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
+        elif fmt == 'csv':
+            output_data['csv'] = df.to_csv(index=False)
+        elif fmt == 'xlsx':
+            xlsx_buffer = BytesIO()
+            df.to_excel(xlsx_buffer, index=False)
+            xlsx_buffer.seek(0)
+            output_data['xlsx'] = xlsx_buffer.read()
+        elif fmt == 'xml':
+            try:
+                output_data['xml'] = df.to_xml(root_name='dataset', index=False)
+            except Exception:
+                output_data['xml'] = '<error>XML export failed</error>'
+        else:
+            output_data[fmt] = f'<error>Unsupported format: {fmt}</error>'
     return {
         'status': 'processed',
         'type': 'image',
         'original_files': file_paths,
         'output_formats': output_formats,
         'description': description,
-        'tabular_output': tabular_output
+        'tabular_output': tabular_output,
+        'outputs': output_data
     }
 
 # Example video file processing
@@ -131,7 +162,7 @@ def process_video_files(file_paths, output_formats, description):
         'description': description
     }
 
-def select_representative_images(image_arrays, sample_size=20):
+def select_representative_images(image_arrays, sample_size=5):
     """
     Select a representative sample of images from the dataset.
     Uses random sampling if the dataset is larger than sample_size.
