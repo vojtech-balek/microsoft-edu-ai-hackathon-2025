@@ -143,7 +143,7 @@ def create_dataframe_from_tabular(tabular_output):
 def process_image_files(file_paths, output_formats, description=None):
     """Process image files: resize, encode, extract features, and format output."""
     # Step 1: Load and preprocess images
-    start_time = time.time()
+    prompt_start_time = time.time()
     image_base64_list = []
     for path in file_paths:
         img = Image.open(path).convert('RGB')
@@ -155,10 +155,13 @@ def process_image_files(file_paths, output_formats, description=None):
     # Step 3: Build prompt for feature discovery
     dataset_name = "Image Dataset"
     prompt = build_image_prompt(dataset_name, description, rep_images)
+    prompt_elapsed = time.time() - prompt_start_time
+    print(f"Prompt creation time: {prompt_elapsed:.2f} seconds")
     # Step 4: Feature extraction using multimodal LLM
     feature_spec_start = time.time()
     feature_spec = extract_image_features_with_llm(rep_images, prompt=prompt)
     feature_prompt_time = time.time() - feature_spec_start
+    print(f"Feature prompt generation time: {feature_prompt_time:.2f} seconds")
     feature_prompt = str(feature_spec[0])
     # Step 5: Feature generation for all images (parallel)
     def extract_single(img_b64):
@@ -171,6 +174,7 @@ def process_image_files(file_paths, output_formats, description=None):
             all_features.append(future.result())
     all_features = [future.result() for future in futures]
     feature_value_time = time.time() - feature_value_start
+    print(f"Feature value generation time: {feature_value_time:.2f} seconds")
     # Step 6: Output tabular dataset
     tabular_output = {os.path.basename(fp): features for fp, features in zip(file_paths, all_features)}
     # Step 7: Postprocess according to output_formats
