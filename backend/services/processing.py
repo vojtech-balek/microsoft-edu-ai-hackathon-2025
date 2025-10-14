@@ -17,7 +17,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-from .speech_service import transcribe_audio_file
+from .speech_service import transcribe_video_file
 
 
 def process_files(file_paths, file_type, output_formats=None, description=None):
@@ -98,6 +98,7 @@ def process_image_files(file_paths, output_formats, description=None):
     image_base64_list = []
     for path in file_paths:
         img = Image.open(path).convert('RGB')
+        img = resize_with_padding(img, target_size=(768, 768))
         buffered = io.BytesIO()
         img.save(buffered, format="JPEG")
         img_b64 = base64.b64encode(buffered.getvalue()).decode()
@@ -112,19 +113,22 @@ def process_image_files(file_paths, output_formats, description=None):
     # Ensure feature_spec is a dict and get features for prompt
 
     feature_prompt = str(feature_spec[0])
+    print("before threadpool")
 
     # Step 5: Feature generation for all images (parallel)
     def extract_single(img_b64):
         return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
     all_features = []
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
-        for future in as_completed(futures):
-            all_features.append(future.result())
-    # Preserve original order (already preserved by futures list)
-    all_features = [future.result() for future in futures]
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        print("inside threadpool")
+        future_map = {executor.submit(extract_single, img_b64): img_b64 for img_b64 in image_base64_list}
+
+        results_map = {future_map[future]: future.result() for future in as_completed(future_map)}
+
+        all_features = [results_map[img_b64] for img_b64 in image_base64_list]
     # Step 6: Output tabular dataset
     # Map each set of features to its corresponding image filename
+    print("before tabular")
     tabular_output = {}
     for file_path, features in zip(file_paths, all_features):
         filename = os.path.basename(file_path)
@@ -167,34 +171,33 @@ def process_image_files(file_paths, output_formats, description=None):
 
 def process_video_files(file_paths, output_formats, description):
     video_path = file_paths[0]
-
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
-    temp_audio_path = os.path.join('uploads', f"temp_{base_name}_{int(time.time())}.wav")
-
+    key_frame_paths = []
+    print("processing video")
     try:
-        ffmpeg.input(video_path).output(
-            temp_audio_path,
-            acodec='pcm_s16le',
-            ac=1,
-            ar='16k'
-        ).run(quiet=True, overwrite_output=True)
-    except ffmpeg.Error:
-        return {'status': 'error', 'message': 'Failed to extract audio from video.'}
+        print("extracting key frames")
+        key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
+        print("key frames done")
+        if not key_frame_arrays:
+            return {'status': 'error', 'message': 'No key frames found in video.'}
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        for i, frame in enumerate(key_frame_arrays):
+            path = os.path.join('uploads', f"{base_name}_keyframe_{i}.jpg")
+            cv2.imwrite(path, frame)
+            key_frame_paths.append(path)
+        image_pipeline_result = process_image_files(key_frame_paths, output_formats, description)
 
-    transcript = transcribe_audio_file(temp_audio_path, model_choice='fast')
-
-    try:
-        os.remove(temp_audio_path)
-    except OSError:
-        pass
-
-    return {
-        'status': 'processed',
-        'type': 'video',
-        'original_file': video_path,
-        'transcription': transcript,
-        'description': description
-    }
+        final_result = {
+            'status': 'processed',
+            'type': 'video',
+            'original_file': video_path,
+            'description': description,
+            'key_frame_analysis': image_pipeline_result
+        }
+        return final_result
+    finally:
+        for path in key_frame_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 def select_representative_images(image_arrays, sample_size=20):
     """
@@ -250,3 +253,15 @@ def extract_key_frames(video_path, frame_limit=8, sharpness_threshold=100.0):
 
     cap.release()
     return key_frames
+
+def resize_with_padding(image, target_size=(1024, 1024), background_color="black"):
+    image.thumbnail(target_size)
+
+    new_image = Image.new("RGB", target_size, background_color)
+
+    left = (target_size[0] - image.width) // 2
+    top = (target_size[1] - image.height) // 2
+
+    new_image.paste(image, (left, top))
+
+    return new_image
