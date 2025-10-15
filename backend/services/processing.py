@@ -15,7 +15,13 @@ import json
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import PyPDF2
-from .speech_service import transcribe_audio_file
+import logging
+from typing import List, Optional, Any
+
+from .speech_service import transcribe_video_file
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 def process_files(file_paths, file_type, output_formats=None, description=None):
     if output_formats is None:
@@ -33,20 +39,32 @@ def process_files(file_paths, file_type, output_formats=None, description=None):
 
 # Example text file processing (PDF)
 def process_text_files(file_paths, output_formats, description, target=None):
-    t0 = time.time()
+    print("zavolan process text")
     # Step 1: Extract text layer from each PDF file
     extracted_texts = {}
     for file_path in file_paths:
+        filename = os.path.basename(file_path)
         try:
-            with open(file_path, 'rb') as f:
-                reader = PyPDF2.PdfReader(f)
-                text = ''
-                for page in reader.pages:
-                    text += page.extract_text() or ''
-            filename = os.path.basename(file_path)
-            extracted_texts[filename] = text
+            _, ext = os.path.splitext(file_path)
+            ext = ext.lower()
+            if ext == '.pdf':
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text = ''
+                    for page in reader.pages:
+                        text += page.extract_text() or ''
+                extracted_texts[filename] = text
+            elif ext in ['.txt', '.md', '.log', '.csv']:  # běžné textové formáty
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                extracted_texts[filename] = text
+            else:
+                # Pokud neznáme formát, zkusíme načíst jako text (např. shrnutí z videa je .txt)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                extracted_texts[filename] = text
         except Exception as e:
-            extracted_texts[os.path.basename(file_path)] = f'<error extracting text: {e}>'
+            extracted_texts[filename] = f'<error extracting text: {e}>'
     # Step 2: Select representative texts
     texts_list = list(extracted_texts.values())
     rep_texts = select_representative_images(texts_list, sample_size=1)  # reuse sampling logic
@@ -213,35 +231,207 @@ def process_image_files(file_paths, output_formats, description=None):
         'feature_value_time': feature_value_time
     }
 
-def process_video_files(file_paths, output_formats, description):
-    video_path = file_paths[0]
-    key_frame_paths = []
-    print("processing video")
-    try:
-        print("extracting key frames")
-        key_frame_arrays = extract_key_frames(video_path, frame_limit=5)
-        print("key frames done")
-        if not key_frame_arrays:
-            return {'status': 'error', 'message': 'No key frames found in video.'}
-        base_name = os.path.splitext(os.path.basename(video_path))[0]
-        for i, frame in enumerate(key_frame_arrays):
-            path = os.path.join('uploads', f"{base_name}_keyframe_{i}.jpg")
-            cv2.imwrite(path, frame)
-            key_frame_paths.append(path)
-        image_pipeline_result = process_image_files(key_frame_paths, output_formats, description)
 
-        final_result = {
-            'status': 'processed',
-            'type': 'video',
-            'original_file': video_path,
-            'description': description,
-            'key_frame_analysis': image_pipeline_result
+import os
+import io
+import json
+import base64
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+from typing import List, Optional
+from io import BytesIO
+
+def process_video_files(
+    file_paths: List[str],
+    output_formats: Optional[List[str]] = None,
+    description: Optional[str] = None
+) -> dict:
+    if not isinstance(file_paths, (list, tuple)) or not file_paths:
+        return {
+            'status': 'error',
+            'error': 'file_paths must be a non-empty list of file paths',
+            'type': 'video'
         }
-        return final_result
-    finally:
-        for path in key_frame_paths:
-            if os.path.exists(path):
-                os.remove(path)
+
+    if output_formats is None:
+        output_formats = ['json']
+    elif not isinstance(output_formats, (list, tuple)):
+        output_formats = [str(output_formats)]
+
+    output_formats = [fmt.lower() for fmt in output_formats if isinstance(fmt, str)]
+
+    consolidated_tabular_output = {}
+    feature_spec_from_text = None
+    all_transcripts = {}
+    all_summaries = {}
+
+    for video_path in file_paths:
+        if not isinstance(video_path, str) or not os.path.isfile(video_path):
+            error_msg = f"Invalid or non-existent video path: {video_path}"
+            logger.error(error_msg)
+            filename = os.path.basename(str(video_path)) if isinstance(video_path, str) else "unknown"
+            consolidated_tabular_output[filename] = {"error": error_msg}
+            all_transcripts[filename] = ""
+            all_summaries[filename] = ""
+            continue
+
+        filename = os.path.basename(video_path)
+        base_name = os.path.splitext(filename)[0]
+        temp_summary_path = None
+
+        try:
+            # --- 1. Transkripce ---
+            try:
+                transcript = transcribe_video_file(video_path)
+                if not isinstance(transcript, str):
+                    transcript = str(transcript) if transcript is not None else ""
+            except Exception as e:
+                transcript = ""
+                logger.error(f"Transcription failed for {filename}: {e}")
+            all_transcripts[filename] = transcript
+
+            # --- 2. Extrakce klíčových snímků ---
+            try:
+                key_frame_arrays = extract_key_frames(video_path, frame_limit=8)
+                if not key_frame_arrays or not isinstance(key_frame_arrays, (list, tuple)):
+                    raise ValueError("No key frames returned")
+            except Exception as e:
+                error_msg = f"Frame extraction failed: {e}"
+                logger.error(f"{error_msg} for {filename}")
+                consolidated_tabular_output[filename] = {"error": error_msg}
+                all_summaries[filename] = ""
+                continue
+
+            # --- 3. Převod snímků na base64 ---
+            frame_b64_list = []
+            for i, frame in enumerate(key_frame_arrays):
+                try:
+                    if isinstance(frame, np.ndarray):
+                        if frame.size == 0:
+                            continue
+                        if frame.ndim == 3 and frame.shape[2] == 3:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        else:
+                            frame_rgb = frame
+                        pil_image = Image.fromarray(frame_rgb.astype('uint8'), 'RGB')
+                    elif hasattr(frame, 'save'):
+                        pil_image = frame
+                    else:
+                        logger.warning(f"Unsupported frame type {type(frame)} in {filename}, skipping frame {i}")
+                        continue
+
+                    buffered = io.BytesIO()
+                    pil_image.save(buffered, format="JPEG")
+                    frame_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                    frame_b64_list.append(frame_b64)
+                except Exception as e:
+                    logger.warning(f"Failed to process frame {i} in {filename}: {e}")
+                    continue
+
+            if not frame_b64_list:
+                error_msg = "No valid frames could be processed."
+                consolidated_tabular_output[filename] = {"error": error_msg}
+                all_summaries[filename] = ""
+                continue
+
+            # --- 4. Generování shrnutí ---
+            summary_prompt = (
+                "You are an expert video analyst with deep knowledge in multimodal understanding (audio + visual). "
+                "Your task is to produce an exceptionally detailed, comprehensive, and structured summary of the provided file. "
+                "Use BOTH the full transcript AND the key visual frames to create a rich, insightful analysis. "
+                "Do NOT be brief. Write a long, thorough summary (at least 300–500 words).\n\n"
+                f"Transcript:\n{transcript}"
+            )
+
+            try:
+                video_summary = extract_image_features_with_llm(frame_b64_list, prompt=summary_prompt, feature_gen=True)
+                if not isinstance(video_summary, str):
+                    video_summary = str(video_summary) if video_summary is not None else ""
+            except Exception as e:
+                video_summary = f"[ERROR: Summary generation failed: {e}]"
+                logger.error(f"LLM summarization failed for {filename}: {e}")
+
+            all_summaries[filename] = video_summary
+
+        finally:
+            if temp_summary_path and os.path.exists(temp_summary_path):
+                try:
+                    os.remove(temp_summary_path)
+                except Exception:
+                    pass
+
+    # === 6. Společná textová analýza všech summaries ===
+    summary_files = []
+    os.makedirs('uploads', exist_ok=True)
+    for filename, summary_text in all_summaries.items():
+        temp_summary_path = os.path.join('uploads', f"summary_{os.path.splitext(filename)[0]}.txt")
+        with open(temp_summary_path, 'w', encoding='utf-8') as f:
+            f.write(summary_text)
+        summary_files.append(temp_summary_path)
+
+    try:
+        multi_video_result = process_text_files(summary_files, output_formats, description)
+
+        for summary_path in summary_files:
+            summary_filename = os.path.basename(summary_path)
+            video_name = summary_filename.replace("summary_", "").replace(".txt", "")
+            if summary_filename in multi_video_result.get('tabular_output', {}):
+                consolidated_tabular_output[video_name] = multi_video_result['tabular_output'][summary_filename]
+            else:
+                consolidated_tabular_output[video_name] = {"error": "No structured data returned"}
+
+        feature_spec_from_text = multi_video_result.get('feature_specification')
+
+    except Exception as e:
+        logger.error(f"Text analysis failed: {e}")
+        for filename in all_summaries.keys():
+            consolidated_tabular_output[filename] = {"error": f"Text analysis failed: {e}"}
+
+    # === 7. Generování výstupních formátů ===
+    output_data = {}
+    valid_formats = {'json', 'csv', 'xlsx', 'xml'}
+    output_formats = [fmt for fmt in output_formats if fmt in valid_formats] or ['json']
+
+    for fmt in output_formats:
+        try:
+            if fmt == 'json':
+                output_data['json'] = json.dumps(consolidated_tabular_output, ensure_ascii=False, indent=2)
+            elif consolidated_tabular_output:
+                df = pd.DataFrame.from_dict(consolidated_tabular_output, orient='index')
+                if not df.empty:
+                    df = df.applymap(lambda x: x[0] if isinstance(x, list) and len(x) == 1 else x)
+
+                if fmt == 'csv':
+                    output_data['csv'] = df.to_csv()
+                elif fmt == 'xlsx':
+                    xlsx_buffer = BytesIO()
+                    df.to_excel(xlsx_buffer, index=True)
+                    xlsx_buffer.seek(0)
+                    output_data['xlsx'] = xlsx_buffer.read()
+                elif fmt == 'xml':
+                    output_data['xml'] = df.to_xml(root_name='dataset')
+        except Exception as e:
+            logger.error(f"Output format '{fmt}' generation failed: {e}")
+            if fmt == 'json':
+                output_data['json'] = json.dumps({"error": f"JSON output failed: {str(e)}"}, indent=2)
+            else:
+                output_data[fmt] = f"<error>Export to {fmt} failed: {e}</error>"
+
+    return {
+        'status': 'processed',
+        'type': 'video',
+        'original_files': list(file_paths),
+        'output_formats': output_formats,
+        'description': description or "",
+        'tabular_output': consolidated_tabular_output,
+        'outputs': output_data,
+        'feature_specification': feature_spec_from_text,
+        'transcripts': all_transcripts,
+        'summaries': all_summaries
+    }
+
 
 def select_representative_images(image_arrays, sample_size=20):
     """
@@ -403,3 +593,31 @@ image_prompt_template = Template("""
     }
 }
 """)
+
+
+def create_collage(image_arrays, collage_width=1024):
+    if not image_arrays:
+        return None
+
+    target_height = collage_width // len(image_arrays)
+    pil_images = []
+    total_width = 0
+    for frame in image_arrays:
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img_rgb)
+
+        ratio = target_height / img.height
+        new_width = int(img.width * ratio)
+        img = img.resize((new_width, target_height), Image.LANCZOS)
+
+        pil_images.append(img)
+        total_width += new_width
+
+    collage = Image.new('RGB', (total_width, target_height))
+
+    current_x = 0
+    for img in pil_images:
+        collage.paste(img, (current_x, 0))
+        current_x += img.width
+
+    return collage
