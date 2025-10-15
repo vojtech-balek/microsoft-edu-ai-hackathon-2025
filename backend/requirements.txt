@@ -10,3 +10,4 @@ pandas
 opencv-python
 ffmpeg
 PyPDF2
+openpyxl

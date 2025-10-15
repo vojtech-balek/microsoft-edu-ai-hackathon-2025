@@ -7,7 +7,6 @@ from PIL import Image
 import base64
 import io
 import numpy as np
-from string import Template
 from .openai_service import extract_image_features_with_llm, extract_text_features_with_llm
 import random
 import pandas as pd
@@ -17,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import PyPDF2
 import logging
 from typing import List, Optional, Any
-
+from .prompts import text_feature_extraction_prompt, image_feature_extraction_prompt
 from .speech_service import transcribe_video_file
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,11 +71,9 @@ def process_text_files(file_paths, output_formats, description, target=None):
     dataset_name = "Text Dataset"
     target = target or "<target>"
     examples_str = '\n---\n'.join(rep_texts)
-    prompt = prompt_template.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
+    prompt = text_feature_extraction_prompt.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
     # Step 4: Feature extraction using LLM (timed)
     feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
-    feature_prompt_time = time.time() - t0
-    print(f"{feature_prompt_time = }")
     feature_prompt = str(feature_spec[0])
     # Step 5: Feature generation for all texts (parallel, timed)
     def extract_single(text):
@@ -134,7 +131,7 @@ def process_text_files(file_paths, output_formats, description, target=None):
 def build_image_prompt(name, description, rep_images):
     # Use base64 strings directly for representative images
     examples_str = '\n'.join(rep_images)
-    return image_prompt_template.substitute(name=name, description=description)
+    return image_feature_extraction_prompt.substitute(name=name, description=description)
 
 # Main image processing pipeline
 
@@ -175,7 +172,7 @@ def process_image_files(file_paths, output_formats, description=None):
     prompt = build_image_prompt(dataset_name, description, rep_images)
     prompt_elapsed = time.time() - prompt_start_time
     print(f"Prompt creation time: {prompt_elapsed:.2f} seconds")
-    # Step 4: Feature extraction using multimodal LLM
+    # Step 4: Feature discovery using multimodal LLM
     feature_spec_start = time.time()
     feature_spec = extract_image_features_with_llm(rep_images, prompt=prompt)
     feature_prompt_time = time.time() - feature_spec_start
@@ -499,101 +496,6 @@ def resize_with_padding(image, target_size=(1024, 1024), background_color="black
     new_image.paste(image, (left, top))
 
     return new_image
-
-# Universal prompt template for text feature extraction
-prompt_template = Template("""
-{
-    "system_message": "IMPORTANT: Return only a valid JSON object with no explanations, text, or markdown!!! Do not include any commentary or introductory text!!!",
-    "input_metadata": {
-        "dataset_name": "$name",
-        "description": "$description",
-        "target": "$target",
-        "examples": "$examples"
-    },
-    "task": {
-        "steps": [
-            "Analyze the provided metadata and examples to determine the domain and context of the dataset.",
-            "Identify the key characteristics of the dataset relevant to predicting the target variable.",
-            "Extract at least 20 distinct features from the representative images.",
-            "Based on provided examples, try to generalize on the domain",
-            "List potential high-level categorical and numerical features based on domain knowledge inferred from the dataset description.",
-            "Extract additional potential features from dataset examples using syntactic and semantic patterns, ensuring at least 20 distinct features are generated.",
-            "If the text implies certain values that match the target, these values may also be extracted as features. In cases where the target has multiple values, each value can be independently derived from the text as a feature if it is contextually appropriate.",
-            "For text-based datasets, identify key phrases, structural components, and linguistic patterns that are relevant.",
-            "For numerical datasets, identify aggregation patterns, distributional characteristics, and possible transformations.",
-            "Group related features into meaningful categories where applicable.",
-            "If a feature has more than 15 unique categories, group less frequent categories into an 'Other' class.",
-            "For each identified feature, provide a clear name, description, a complete list of possible values, and a specific LLM extraction query."
-        ],
-        "constraints": [
-            "Ensure features are distinct and non-redundant.",
-            "Note that the target variable is not explicitly present in the input text.",
-            "Prioritize domain-specific insights over generic ones.",
-            "Ensure output is a structured, valid JSON format.",
-            "For categorical variables, list possible values with domain justification.",
-            "For numeric variables, provide possible transformations (e.g., log, mean differences).",
-            "The extraction queries must be specific and detailed to ensure high-quality feature generation.",
-            "Tailor extraction queries to the domain context of the dataset.",
-            "Generate a diverse set of features to maximize potential predictive power."
-        ]
-    },
-    "output_format": {
-        "type": "json",
-        "structure": {
-            "features": [
-                {
-                    "feature_name": "<Name of the categorical or numerical feature>",
-                    "description": "<Short description of what the feature represents and how it relates to the dataset's context>",
-                    "possible_values": ["<Value 1>", "<Value 2>", "...", "<Value n>"],
-                    "extraction_query": "Identify the '<feature_name>' based on the provided context. Options: '<Value 1>', '<Value 2>', ..., '<Value n>'."
-                }
-            ]
-        }
-    }
-    }
-""")
-
-
-# Universal prompt template for image feature discovery
-image_prompt_template = Template("""
-{
-    "system_message": "IMPORTANT: Return only a valid JSON object with no explanations, text, or markdown!!! Do not include any commentary or introductory text!!!",
-    "input_metadata": {
-        "dataset_name": "$name",
-        "description": "$description",
-    },
-    "task": {
-        "steps": [
-            "Analyze the provided metadata and representative images to determine the domain and context of the dataset.",
-            "Identify key visual characteristics relevant to feature extraction.",
-            "List potential high-level categorical and numerical features based on domain knowledge and image content.",
-            "Extract at least 20 distinct features from the representative images.",
-            "For each identified feature, provide a clear name, description, possible values, and a specific LLM extraction query."
-        ],
-        "constraints": [
-            "Ensure features are distinct and non-redundant.",
-            "Prioritize domain-specific insights over generic ones.",
-            "Ensure output is a structured, valid JSON format.",
-            "Tailor extraction queries to the domain context of the dataset.",
-            "Generate a diverse set of features to maximize potential predictive power."
-        ]
-    },
-    "output_format": {
-        "type": "json",
-        "structure": {
-            "features": [
-                {
-                    "feature_name": "<Name>",
-                    "description": "<Description>",
-                    "possible_values": ["<Value 1>", "<Value 2>", ...],
-                    "extraction_query": "<Query>"
-                }
-            ]
-        }
-    }
-}
-""")
-
 
 def create_collage(image_arrays, collage_width=1024):
     if not image_arrays:

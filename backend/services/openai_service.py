@@ -22,9 +22,10 @@ def image_to_base64(img_arr):
     img.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode()
 
+
 def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_name=None, feature_gen=False) -> list:
     features_list = []
-
+    # print(clean_json_output(prompt))
     for img_b64 in image_base64_list:
         if prompt is None:
             prompt_text = "Extract meaningful features from this image for tabular dataset construction."
@@ -53,7 +54,7 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
                             "content": user_content
                         }
                     ],
-                    max_tokens=512,
+                    max_tokens=2048,
                     temperature=0.0
                 )
                 content = response.choices[0].message.content
@@ -86,7 +87,7 @@ def extract_text_features_with_llm(text_list, prompt=None, deployment_name=None,
         max_retries = 5
         backoff = 2
         if feature_gen:
-            prompt_text = """You are a feature extraction assistant for text documents. 
+            prompt_text = """You are a feature extraction assistant for text documents.
                         You provide output in a structured JSON format and do NOT provide any explanations.
                         {
                           "<feature1_name>": "<value1>",
