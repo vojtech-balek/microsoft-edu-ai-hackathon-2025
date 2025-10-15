@@ -1,7 +1,6 @@
 # processing.py - Modular file processing service
 import os
 import time
-
 import cv2
 import ffmpeg
 from PIL import Image
@@ -74,19 +73,23 @@ def process_text_files(file_paths, output_formats, description, target=None):
     target = target or "<target>"
     examples_str = '\n---\n'.join(rep_texts)
     prompt = prompt_template.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
-    # Step 4: Feature extraction using LLM
+    # Step 4: Feature extraction using LLM (timed)
     feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
-    print(f"{feature_spec = }")
+    feature_prompt_time = time.time() - t0
+    print(f"{feature_prompt_time = }")
     feature_prompt = str(feature_spec[0])
-    # Step 5: Feature generation for all texts (parallel)
+    # Step 5: Feature generation for all texts (parallel, timed)
     def extract_single(text):
         return extract_text_features_with_llm([text], prompt=feature_prompt, feature_gen=True)
+    t1 = time.time()
     all_features = []
     with ThreadPoolExecutor() as executor:
         futures = [executor.submit(extract_single, text) for text in texts_list]
         for future in as_completed(futures):
             all_features.append(future.result())
     all_features = [future.result() for future in futures]
+    feature_value_time = time.time() - t1
+    print(f"{feature_value_time = }")
     # Step 6: Output tabular dataset
     tabular_output = {}
     for filename, features in zip(extracted_texts.keys(), all_features):
@@ -127,112 +130,89 @@ def process_text_files(file_paths, output_formats, description, target=None):
         'feature_specification': feature_prompt
     }
 
-# Universal prompt template for image feature discovery
-image_prompt_template = Template("""
-{
-    "system_message": "IMPORTANT: Return only a valid JSON object with no explanations, text, or markdown!!! Do not include any commentary or introductory text!!!",
-    "input_metadata": {
-        "dataset_name": "$name",
-        "description": "$description",
-        "representative_images": "$examples"
-    },
-    "task": {
-        "steps": [
-            "Analyze the provided metadata and representative images to determine the domain and context of the dataset.",
-            "Identify key visual characteristics relevant to feature extraction.",
-            "List potential high-level categorical and numerical features based on domain knowledge and image content.",
-            "Extract at least 20 distinct features from the representative images.",
-            "For each identified feature, provide a clear name, description, possible values, and a specific LLM extraction query."
-        ],
-        "constraints": [
-            "Ensure features are distinct and non-redundant.",
-            "Prioritize domain-specific insights over generic ones.",
-            "Ensure output is a structured, valid JSON format.",
-            "Tailor extraction queries to the domain context of the dataset.",
-            "Generate a diverse set of features to maximize potential predictive power."
-        ]
-    },
-    "output_format": {
-        "type": "json",
-        "structure": {
-            "features": [
-                {
-                    "feature_name": "<Name>",
-                    "description": "<Description>",
-                    "possible_values": ["<Value 1>", "<Value 2>", ...],
-                    "extraction_query": "<Query>"
-                }
-            ]
-        }
-    }
-}
-""")
 
 def build_image_prompt(name, description, rep_images):
     # Use base64 strings directly for representative images
     examples_str = '\n'.join(rep_images)
-    return image_prompt_template.substitute(name=name, description=description, examples=examples_str)
+    return image_prompt_template.substitute(name=name, description=description)
 
 # Main image processing pipeline
 
+def resize_image(img, size=(500, 500)):
+    """Resize a PIL image to the given size."""
+    return img.resize(size)
+
+def encode_image_to_base64(img, format="JPEG"):
+    """Encode a PIL image to base64 string."""
+    buffered = io.BytesIO()
+    img.save(buffered, format=format)
+    return base64.b64encode(buffered.getvalue()).decode()
+
+def create_dataframe_from_tabular(tabular_output):
+    """Create a pandas DataFrame from tabular_output, handling lists of dicts."""
+    rows = []
+    for v in tabular_output.values():
+        if isinstance(v, list) and len(v) > 0:
+            rows.append(v[0])
+        else:
+            rows.append(v)
+    return pd.DataFrame(rows, index=tabular_output.keys())
+
 def process_image_files(file_paths, output_formats, description=None):
-    # Step 1: Load images and store as base64
+    """Process image files: resize, encode, extract features, and format output."""
+    # Step 1: Load and preprocess images
+    prompt_start_time = time.time()
     image_base64_list = []
     for path in file_paths:
         img = Image.open(path).convert('RGB')
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_b64 = base64.b64encode(buffered.getvalue()).decode()
+        img = resize_image(img)
+        img_b64 = encode_image_to_base64(img)
         image_base64_list.append(img_b64)
-    # Step 2: Select representative images (base64)
+    # Step 2: Select representative images
     rep_images = select_representative_images(image_base64_list, sample_size=20)
     # Step 3: Build prompt for feature discovery
     dataset_name = "Image Dataset"
     prompt = build_image_prompt(dataset_name, description, rep_images)
+    prompt_elapsed = time.time() - prompt_start_time
+    print(f"Prompt creation time: {prompt_elapsed:.2f} seconds")
     # Step 4: Feature extraction using multimodal LLM
+    feature_spec_start = time.time()
     feature_spec = extract_image_features_with_llm(rep_images, prompt=prompt)
-    # Ensure feature_spec is a dict and get features for prompt
-
+    feature_prompt_time = time.time() - feature_spec_start
+    print(f"Feature prompt generation time: {feature_prompt_time:.2f} seconds")
     feature_prompt = str(feature_spec[0])
-
     # Step 5: Feature generation for all images (parallel)
     def extract_single(img_b64):
         return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
+    feature_value_start = time.time()
     all_features = []
     with ThreadPoolExecutor(max_workers=10) as executor:
-        print("inside threadpool")
-        future_map = {executor.submit(extract_single, img_b64): img_b64 for img_b64 in image_base64_list}
-
-        results_map = {future_map[future]: future.result() for future in as_completed(future_map)}
-
-        all_features = [results_map[img_b64] for img_b64 in image_base64_list]
+        futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
+        for future in as_completed(futures):
+            all_features.append(future.result())
+    all_features = [future.result() for future in futures]
+    feature_value_time = time.time() - feature_value_start
+    print(f"Feature value generation time: {feature_value_time:.2f} seconds")
     # Step 6: Output tabular dataset
-    # Map each set of features to its corresponding image filename
-    print("before tabular")
-    tabular_output = {}
-    for file_path, features in zip(file_paths, all_features):
-        filename = os.path.basename(file_path)
-        tabular_output[filename] = features
+    tabular_output = {os.path.basename(fp): features for fp, features in zip(file_paths, all_features)}
     # Step 7: Postprocess according to output_formats
     output_data = {}
+    df = create_dataframe_from_tabular(tabular_output)
     if not output_formats:
-        output_formats = ['json']  # Default to JSON if none specified
+        output_formats = ['json']
     for fmt in output_formats:
         fmt = fmt.lower()
         if fmt == 'json':
             output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
         elif fmt == 'csv':
-            df = pd.DataFrame.from_dict(tabular_output, orient='index')
             output_data['csv'] = df.to_csv()
         elif fmt == 'xlsx':
-            df = pd.DataFrame.from_dict(tabular_output, orient='index')
             xlsx_buffer = BytesIO()
             df.to_excel(xlsx_buffer)
             xlsx_buffer.seek(0)
             output_data['xlsx'] = xlsx_buffer.read()
         elif fmt == 'xml':
             try:
-                df = pd.DataFrame.from_dict(tabular_output, orient='index')
                 output_data['xml'] = df.to_xml(root_name='dataset')
             except Exception:
                 output_data['xml'] = '<error>XML export failed</error>'
@@ -246,7 +226,9 @@ def process_image_files(file_paths, output_formats, description=None):
         'description': description,
         'tabular_output': tabular_output,
         'outputs': output_data,
-        'feature_specification': feature_prompt
+        'feature_specification': feature_prompt,
+        'feature_prompt_time': feature_prompt_time,
+        'feature_value_time': feature_value_time
     }
 
 
@@ -564,6 +546,47 @@ prompt_template = Template("""
                     "description": "<Short description of what the feature represents and how it relates to the dataset's context>",
                     "possible_values": ["<Value 1>", "<Value 2>", "...", "<Value n>"],
                     "extraction_query": "Identify the '<feature_name>' based on the provided context. Options: '<Value 1>', '<Value 2>', ..., '<Value n>'."
+                }
+            ]
+        }
+    }
+    }
+""")
+
+
+# Universal prompt template for image feature discovery
+image_prompt_template = Template("""
+{
+    "system_message": "IMPORTANT: Return only a valid JSON object with no explanations, text, or markdown!!! Do not include any commentary or introductory text!!!",
+    "input_metadata": {
+        "dataset_name": "$name",
+        "description": "$description",
+    },
+    "task": {
+        "steps": [
+            "Analyze the provided metadata and representative images to determine the domain and context of the dataset.",
+            "Identify key visual characteristics relevant to feature extraction.",
+            "List potential high-level categorical and numerical features based on domain knowledge and image content.",
+            "Extract at least 20 distinct features from the representative images.",
+            "For each identified feature, provide a clear name, description, possible values, and a specific LLM extraction query."
+        ],
+        "constraints": [
+            "Ensure features are distinct and non-redundant.",
+            "Prioritize domain-specific insights over generic ones.",
+            "Ensure output is a structured, valid JSON format.",
+            "Tailor extraction queries to the domain context of the dataset.",
+            "Generate a diverse set of features to maximize potential predictive power."
+        ]
+    },
+    "output_format": {
+        "type": "json",
+        "structure": {
+            "features": [
+                {
+                    "feature_name": "<Name>",
+                    "description": "<Description>",
+                    "possible_values": ["<Value 1>", "<Value 2>", ...],
+                    "extraction_query": "<Query>"
                 }
             ]
         }
