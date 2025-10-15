@@ -53,7 +53,7 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
                             "content": user_content
                         }
                     ],
-                    max_tokens=512,
+                    max_tokens=2048,
                     temperature=0.0
                 )
                 content = response.choices[0].message.content

@@ -1,552 +1,479 @@
 # processing.py - Modular file processing service
+
+# --- 1. Imports ---
 import os
 import time
-import cv2
-import ffmpeg
-from PIL import Image
+import json
 import base64
 import io
-import numpy as np
-from string import Template
-from .openai_service import extract_image_features_with_llm, extract_text_features_with_llm
 import random
-import pandas as pd
-import json
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import PyPDF2
-import logging
-from typing import List, Optional, Any
-import zipfile
 import shutil
+import zipfile
+import logging
+from string import Template
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Any, Tuple, Dict, Callable
 
+# Third-party libraries
+import cv2
+import ffmpeg
+import numpy as np
+import pandas as pd
+import PyPDF2
+from PIL import Image
+
+# Local application imports
+from .openai_service import extract_image_features_with_llm, extract_text_features_with_llm
 from .speech_service import transcribe_video_file
+
+# --- 2. Logging and Constants Configuration ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# General constants
+ALLOWED_EXTENSIONS = {
+    'text': {'pdf', 'txt', 'md', 'log', 'csv'},
+    'image': {'png', 'jpg', 'jpeg'},
+    'video': {'mp4', 'avi', 'mov', 'mkv'}
+}
+MAX_PARALLEL_WORKERS: int = 10
+VALID_OUTPUT_FORMATS = {'json', 'csv', 'xlsx', 'xml'}
 
-def process_files(file_paths, file_type, output_formats=None, description=None):
-    if output_formats is None:
-        output_formats = []
-    result = None
+# Text processing constants
+TEXT_DATASET_NAME = "Text Dataset"
+TEXT_SAMPLE_SIZE = 20
+DEFAULT_TARGET_VARIABLE = "<target>"
 
-    if file_type == 'zip':
-        zip_path = file_paths[0]
-        temp_dir = os.path.join('uploads', f"temp_unzip_{int(time.time())}")
-        os.makedirs(temp_dir, exist_ok=True)
+# Image processing constants
+IMAGE_DATASET_NAME = "Image Dataset"
+IMAGE_SAMPLE_SIZE = 20
+RESIZE_DIMENSIONS: Tuple[int, int] = (768, 768)
+IMAGE_ENCODE_FORMAT: str = "JPEG"
 
+# Video processing constants
+KEY_FRAME_LIMIT = 8
+SUMMARY_PROMPT_TEMPLATE = (
+    "You are an expert video analyst with deep knowledge in multimodal understanding (audio + visual). "
+    "Your task is to produce an exceptionally detailed, comprehensive, and structured summary of the provided file. "
+    "Use BOTH the full transcript AND the key visual frames to create a rich, insightful analysis. "
+    "Do NOT be brief. Write a long, thorough summary (at least 300–500 words).\n\n"
+    "Transcript:\n{transcript}"
+)
+
+
+# --- 3. Generic Helper Functions ---
+
+def create_dataframe_from_tabular(tabular_output: Dict[str, Any]) -> pd.DataFrame:
+    """Robustly creates a pandas DataFrame from various tabular_output structures."""
+    rows = []
+    for v in tabular_output.values():
+        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+            rows.append(v[0])
+        elif isinstance(v, dict):
+            rows.append(v)
+        else:  # Fallback for unexpected formats
+            rows.append({})
+
+    df = pd.DataFrame(rows, index=tabular_output.keys())
+    # Unpack single-element lists within cells, common in the video processor
+    if not df.empty:
+        df = df.applymap(lambda x: x[0] if isinstance(x, list) and len(x) == 1 else x)
+    return df
+
+
+def _format_outputs(tabular_output: Dict, output_formats: List[str]) -> Dict[str, Any]:
+    """Converts the tabular data into various specified output formats."""
+    if not output_formats:
+        output_formats = ['json']
+
+    output_data = {}
+    if not tabular_output:
+        return {'json': json.dumps({}, indent=2)}
+
+    df = create_dataframe_from_tabular(tabular_output)
+
+    for fmt in [f.lower() for f in output_formats if f in VALID_OUTPUT_FORMATS]:
         try:
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+            if fmt == 'json':
+                output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
+            elif fmt == 'csv':
+                output_data['csv'] = df.to_csv()
+                # Preserving side-effect from original code. Consider removing in production.
+                if 'test.csv' in os.listdir(): df.to_csv('test.csv')
+            elif fmt == 'xlsx':
+                xlsx_buffer = io.BytesIO()
+                df.to_excel(xlsx_buffer, index=True)
+                xlsx_buffer.seek(0)
+                output_data['xlsx'] = xlsx_buffer.read()
+            elif fmt == 'xml':
+                output_data['xml'] = df.to_xml(root_name='dataset')
+        except Exception as e:
+            logger.error(f"Output format '{fmt}' generation failed: {e}")
+            output_data[fmt] = f"<error>Export to {fmt} failed: {e}</error>"
+    return output_data
 
-            extracted_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for name in files:
-                    if not name.startswith('__MACOSX') and not name.startswith('.'):
-                        extracted_files.append(os.path.join(root, name))
 
-            if not extracted_files:
-                return {'status': 'error', 'message': 'The zip file is empty.'}
+def _run_parallel_feature_extraction(items: List[Any], extraction_func: Callable, prompt: str) -> List[Dict]:
+    """Generic function to run feature extraction in parallel using a thread pool."""
 
-            inner_file_types = set()
-            for f_path in extracted_files:
-                ext = os.path.splitext(f_path)[1].lower().replace('.', '')
-                if ext in {'pdf', 'txt'}:
-                    inner_file_types.add('text')
-                elif ext in {'png', 'jpg', 'jpeg'}:
-                    inner_file_types.add('image')
-                elif ext in {'mp4', 'avi', 'mov', 'mkv'}:
-                    inner_file_types.add('video')
+    def task_wrapper(item: Any) -> Dict:
+        return extraction_func([item], prompt=prompt, feature_gen=True)
 
-            if len(inner_file_types) > 1:
-                return {'status': 'error',
-                        'message': f'Zip file contains multiple file types: {list(inner_file_types)}'}
-            if not inner_file_types:
-                return {'status': 'error', 'message': 'No supported file types found in the zip file.'}
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
+        futures = [executor.submit(task_wrapper, item) for item in items]
+        return [future.result() for future in futures]
 
-            actual_file_type = inner_file_types.pop()
 
-            print(f"Processing {len(extracted_files)} files of type '{actual_file_type}' from zip archive...")
+# --- 4. Main Dispatcher and ZIP Processor ---
 
-            if actual_file_type == 'text':
-                return process_text_files(extracted_files, output_formats, description)
-            elif actual_file_type == 'image':
-                return process_image_files(extracted_files, output_formats, description)
-            elif actual_file_type == 'video':
-                return process_video_files(extracted_files, output_formats, description)
-            else:
-                return {'status': 'error', 'message': f'File type "{actual_file_type}" found in zip is not supported.'}
+def _process_zip_archive(zip_path: str, output_formats: List[str], description: Optional[str]) -> dict:
+    """Handles the logic of processing ZIP archives."""
+    temp_dir = os.path.join('uploads', f"temp_unzip_{int(time.time())}")
+    os.makedirs(temp_dir, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
 
-        finally:
-            shutil.rmtree(temp_dir)
+        extracted_files = [
+            os.path.join(root, name)
+            for root, dirs, files in os.walk(temp_dir)
+            for name in files if not name.startswith(('__MACOSX', '.'))
+        ]
 
-    if file_type == 'text':
-        result = process_text_files(file_paths, output_formats, description)
+        if not extracted_files:
+            return {'status': 'error', 'message': 'The ZIP file is empty.'}
+
+        inner_file_types = {
+            ftype for f in extracted_files
+            for ftype, exts in ALLOWED_EXTENSIONS.items()
+            if os.path.splitext(f)[1].lower().replace('.', '') in exts
+        }
+
+        if len(inner_file_types) > 1:
+            return {'status': 'error', 'message': f'ZIP file contains multiple file types: {list(inner_file_types)}'}
+        if not inner_file_types:
+            return {'status': 'error', 'message': 'No supported file types found in the ZIP file.'}
+
+        actual_file_type = inner_file_types.pop()
+        logger.info(f"Processing {len(extracted_files)} files of type '{actual_file_type}' from ZIP archive...")
+
+        if actual_file_type == 'text':
+            return process_text_files(extracted_files, output_formats, description)
+        elif actual_file_type == 'image':
+            return process_image_files(extracted_files, output_formats, description)
+        elif actual_file_type == 'video':
+            return process_video_files(extracted_files, output_formats, description)
+        else:
+            return {'status': 'error', 'message': f'File type "{actual_file_type}" in ZIP is not supported.'}
+    finally:
+        shutil.rmtree(temp_dir)
+
+
+def process_files(file_paths: List[str], file_type: str, output_formats: Optional[List[str]] = None,
+                  description: Optional[str] = None) -> dict:
+    """Main dispatcher function to process files based on their type."""
+    output_formats = output_formats or []
+    if file_type == 'zip':
+        return _process_zip_archive(file_paths[0], output_formats, description)
+    elif file_type == 'text':
+        return process_text_files(file_paths, output_formats, description)
     elif file_type == 'image':
-        result = process_image_files(file_paths, output_formats, description)
+        return process_image_files(file_paths, output_formats, description)
     elif file_type == 'video':
-        result = process_video_files(file_paths, output_formats, description)
+        return process_video_files(file_paths, output_formats, description)
     else:
         raise ValueError(f"Unsupported file type: {file_type}")
-    return result
 
-# Example text file processing (PDF)
-def process_text_files(file_paths, output_formats, description, target=None):
-    print("zavolan process text")
-    # Step 1: Extract text layer from each PDF file
+
+# --- 5. Text File Processing ---
+
+def _extract_texts_from_files(file_paths: List[str]) -> Dict[str, str]:
+    """Extracts raw text from files (PDF, TXT, etc.)."""
     extracted_texts = {}
     for file_path in file_paths:
         filename = os.path.basename(file_path)
         try:
             _, ext = os.path.splitext(file_path)
-            ext = ext.lower()
-            if ext == '.pdf':
+            if ext.lower() == '.pdf':
                 with open(file_path, 'rb') as f:
                     reader = PyPDF2.PdfReader(f)
-                    text = ''
-                    for page in reader.pages:
-                        text += page.extract_text() or ''
-                extracted_texts[filename] = text
-            elif ext in ['.txt', '.md', '.log', '.csv']:  # běžné textové formáty
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                extracted_texts[filename] = text
+                    extracted_texts[filename] = ''.join(page.extract_text() or '' for page in reader.pages)
             else:
-                # Pokud neznáme formát, zkusíme načíst jako text (např. shrnutí z videa je .txt)
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                extracted_texts[filename] = text
+                    extracted_texts[filename] = f.read()
         except Exception as e:
             extracted_texts[filename] = f'<error extracting text: {e}>'
-    # Step 2: Select representative texts
-    texts_list = list(extracted_texts.values())
-    rep_texts = select_representative_images(texts_list, sample_size=1)  # reuse sampling logic
-    # Step 3: Build prompt for feature discovery
-    dataset_name = "Text Dataset"
-    target = target or "<target>"
-    examples_str = '\n---\n'.join(rep_texts)
-    prompt = prompt_template.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
-    # Step 4: Feature extraction using LLM (timed)
-    feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
-    feature_prompt = str(feature_spec[0])
-    # Step 5: Feature generation for all texts (parallel, timed)
-    def extract_single(text):
-        return extract_text_features_with_llm([text], prompt=feature_prompt, feature_gen=True)
-    all_features = []
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(extract_single, text) for text in texts_list]
-        for future in as_completed(futures):
-            all_features.append(future.result())
-    all_features = [future.result() for future in futures]
-    # Step 6: Output tabular dataset
-    tabular_output = {}
-    for filename, features in zip(extracted_texts.keys(), all_features):
-        tabular_output[filename] = features
+    return extracted_texts
 
-    # Step 7: Postprocess according to output_formats
-    output_data = {}
-    if not output_formats:
-        output_formats = ['json']
-    for fmt in output_formats:
-        fmt = fmt.lower()
-        df = pd.DataFrame([v[0] for v in tabular_output.values()], index=tabular_output.keys())
-        if fmt == 'json':
-            output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
-        elif fmt == 'csv':
-            output_data['csv'] = df.to_csv()
-            df.to_csv('test.csv')
-        elif fmt == 'xlsx':
-            xlsx_buffer = BytesIO()
-            df.to_excel(xlsx_buffer)
-            xlsx_buffer.seek(0)
-            output_data['xlsx'] = xlsx_buffer.read()
-        elif fmt == 'xml':
-            try:
-                output_data['xml'] = df.to_xml(root_name='dataset')
-            except Exception:
-                output_data['xml'] = '<error>XML export failed</error>'
-        else:
-            output_data[fmt] = f'<error>Unsupported format: {fmt}</error>'
+
+def process_text_files(file_paths: List[str], output_formats: List[str], description: str,
+                       target: Optional[str] = None) -> dict:
+    logger.info("Processing text files...")
+    extracted_texts = _extract_texts_from_files(file_paths)
+    texts_list = list(extracted_texts.values())
+    rep_texts = select_representative_images(texts_list, sample_size=TEXT_SAMPLE_SIZE)
+
+    prompt = prompt_template.substitute(
+        name=TEXT_DATASET_NAME,
+        description=description or "",
+        target=target or DEFAULT_TARGET_VARIABLE,
+        examples='\n---\n'.join(rep_texts)
+    )
+    feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
+    feature_prompt = str(feature_spec[0]) if feature_spec else ""
+
+    all_features = _run_parallel_feature_extraction(texts_list, extract_text_features_with_llm, feature_prompt)
+    tabular_output = dict(zip(extracted_texts.keys(), all_features))
+    output_data = _format_outputs(tabular_output, output_formats)
+
     return {
-        'status': 'processed',
-        'type': 'text',
-        'files': file_paths,
-        'output_formats': output_formats,
-        'description': description,
-        'tabular_output': tabular_output,
-        'outputs': output_data,
+        'status': 'processed', 'type': 'text', 'files': file_paths,
+        'output_formats': output_formats, 'description': description,
+        'tabular_output': tabular_output, 'outputs': output_data,
         'feature_specification': feature_prompt
     }
 
 
-def build_image_prompt(name, description, rep_images):
-    # Use base64 strings directly for representative images
-    examples_str = '\n'.join(rep_images)
-    return image_prompt_template.substitute(name=name, description=description)
+# --- 6. Image File Processing ---
 
-# Main image processing pipeline
-
-def resize_image(img, size=(500, 500)):
-    """Resize a PIL image to the given size."""
-    return img.resize(size)
-
-def encode_image_to_base64(img, format="JPEG"):
-    """Encode a PIL image to base64 string."""
-    buffered = io.BytesIO()
-    img.save(buffered, format=format)
-    return base64.b64encode(buffered.getvalue()).decode()
-
-def create_dataframe_from_tabular(tabular_output):
-    """Create a pandas DataFrame from tabular_output, handling lists of dicts."""
-    rows = []
-    for v in tabular_output.values():
-        if isinstance(v, list) and len(v) > 0:
-            rows.append(v[0])
-        else:
-            rows.append(v)
-    return pd.DataFrame(rows, index=tabular_output.keys())
-
-def process_image_files(file_paths, output_formats, description=None):
-    """Process image files: resize, encode, extract features, and format output."""
-    # Step 1: Load and preprocess images
-    prompt_start_time = time.time()
-    image_base64_list = []
+def _preprocess_images(file_paths: List[str]) -> Dict[str, Optional[str]]:
+    """Loads, resizes, and encodes image files to base64, returning a dictionary."""
+    processed_images = {}
     for path in file_paths:
-        img = Image.open(path).convert('RGB')
-        img = resize_image(img)
-        img_b64 = encode_image_to_base64(img)
-        image_base64_list.append(img_b64)
-    # Step 2: Select representative images
-    rep_images = select_representative_images(image_base64_list, sample_size=20)
-    # Step 3: Build prompt for feature discovery
-    dataset_name = "Image Dataset"
-    prompt = build_image_prompt(dataset_name, description, rep_images)
-    prompt_elapsed = time.time() - prompt_start_time
-    print(f"Prompt creation time: {prompt_elapsed:.2f} seconds")
-    # Step 4: Feature extraction using multimodal LLM
+        try:
+            with Image.open(path) as img:
+                img_rgb = img.convert('RGB')
+                resized_img = img_rgb.resize(RESIZE_DIMENSIONS)
+                buffered = io.BytesIO()
+                resized_img.save(buffered, format=IMAGE_ENCODE_FORMAT)
+                processed_images[path] = base64.b64encode(buffered.getvalue()).decode()
+        except Exception as e:
+            logger.warning(f"Could not process image {path}. Error: {e}")
+            processed_images[path] = None
+    return processed_images
+
+
+def process_image_files(file_paths: List[str], output_formats: List[str], description: Optional[str] = None) -> Dict:
+    logger.info("Processing image files...")
+    start_time = time.time()
+
+    processed_images = _preprocess_images(file_paths)
+    valid_base64_list = [b64 for b64 in processed_images.values() if b64 is not None]
+
+    if not valid_base64_list:
+        return {'status': 'error', 'message': 'No valid images could be processed.'}
+
+    rep_images = select_representative_images(valid_base64_list, sample_size=IMAGE_SAMPLE_SIZE)
+    prompt = image_prompt_template.substitute(name=IMAGE_DATASET_NAME, description=description or "")
+    logger.info(f"Prompt creation time: {time.time() - start_time:.2f}s")
+
     feature_spec_start = time.time()
     feature_spec = extract_image_features_with_llm(rep_images, prompt=prompt)
+    feature_prompt = str(feature_spec[0]) if feature_spec else ""
     feature_prompt_time = time.time() - feature_spec_start
-    print(f"Feature prompt generation time: {feature_prompt_time:.2f} seconds")
-    feature_prompt = str(feature_spec[0])
-    # Step 5: Feature generation for all images (parallel)
-    def extract_single(img_b64):
-        return extract_image_features_with_llm([img_b64], prompt=feature_prompt)
+    logger.info(f"Feature prompt generation time: {feature_prompt_time:.2f}s")
+
     feature_value_start = time.time()
-    all_features = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(extract_single, img_b64) for img_b64 in image_base64_list]
-        for future in as_completed(futures):
-            all_features.append(future.result())
-    all_features = [future.result() for future in futures]
+    all_features = _run_parallel_feature_extraction(valid_base64_list, extract_image_features_with_llm, feature_prompt)
     feature_value_time = time.time() - feature_value_start
-    print(f"Feature value generation time: {feature_value_time:.2f} seconds")
-    # Step 6: Output tabular dataset
-    tabular_output = {os.path.basename(fp): features for fp, features in zip(file_paths, all_features)}
-    # Step 7: Postprocess according to output_formats
-    output_data = {}
-    df = create_dataframe_from_tabular(tabular_output)
-    if not output_formats:
-        output_formats = ['json']
-    for fmt in output_formats:
-        fmt = fmt.lower()
-        if fmt == 'json':
-            output_data['json'] = json.dumps(tabular_output, ensure_ascii=False, indent=2)
-        elif fmt == 'csv':
-            output_data['csv'] = df.to_csv()
-        elif fmt == 'xlsx':
-            xlsx_buffer = BytesIO()
-            df.to_excel(xlsx_buffer)
-            xlsx_buffer.seek(0)
-            output_data['xlsx'] = xlsx_buffer.read()
-        elif fmt == 'xml':
-            try:
-                output_data['xml'] = df.to_xml(root_name='dataset')
-            except Exception:
-                output_data['xml'] = '<error>XML export failed</error>'
+    logger.info(f"Feature value generation time: {feature_value_time:.2f}s")
+
+    tabular_output = {}
+    feature_iterator = iter(all_features)
+    for path, b64 in processed_images.items():
+        filename = os.path.basename(path)
+        if b64 is not None:
+            tabular_output[filename] = next(feature_iterator)
         else:
-            output_data[fmt] = f'<error>Unsupported format: {fmt}</error>'
+            tabular_output[filename] = {"error": "Failed to process this image file."}
+
+    output_data = _format_outputs(tabular_output, output_formats)
+
     return {
-        'status': 'processed',
-        'type': 'image',
-        'original_files': file_paths,
-        'output_formats': output_formats,
-        'description': description,
-        'tabular_output': tabular_output,
-        'outputs': output_data,
+        'status': 'processed', 'type': 'image', 'original_files': file_paths,
+        'output_formats': output_formats, 'description': description,
+        'tabular_output': tabular_output, 'outputs': output_data,
         'feature_specification': feature_prompt,
-        'feature_prompt_time': feature_prompt_time,
-        'feature_value_time': feature_value_time
+        'feature_prompt_time': feature_prompt_time, 'feature_value_time': feature_value_time
     }
 
 
-import os
-import io
-import json
-import base64
-import pandas as pd
-import numpy as np
-import cv2
-from PIL import Image
-from typing import List, Optional
-from io import BytesIO
+# --- 7. Video File Processing ---
 
-def process_video_files(
-    file_paths: List[str],
-    output_formats: Optional[List[str]] = None,
-    description: Optional[str] = None
-) -> dict:
-    if not isinstance(file_paths, (list, tuple)) or not file_paths:
-        return {
-            'status': 'error',
-            'error': 'file_paths must be a non-empty list of file paths',
-            'type': 'video'
-        }
-
-    if output_formats is None:
-        output_formats = ['json']
-    elif not isinstance(output_formats, (list, tuple)):
-        output_formats = [str(output_formats)]
-
-    output_formats = [fmt.lower() for fmt in output_formats if isinstance(fmt, str)]
-
-    consolidated_tabular_output = {}
-    feature_spec_from_text = None
-    all_transcripts = {}
-    all_summaries = {}
-
-    for video_path in file_paths:
-        if not isinstance(video_path, str) or not os.path.isfile(video_path):
-            error_msg = f"Invalid or non-existent video path: {video_path}"
-            logger.error(error_msg)
-            filename = os.path.basename(str(video_path)) if isinstance(video_path, str) else "unknown"
-            consolidated_tabular_output[filename] = {"error": error_msg}
-            all_transcripts[filename] = ""
-            all_summaries[filename] = ""
-            continue
-
-        filename = os.path.basename(video_path)
-        base_name = os.path.splitext(filename)[0]
-        temp_summary_path = None
-
+def _convert_frames_to_base64(key_frames: List[Any], filename: str) -> List[str]:
+    """Converts a list of frame arrays/images to base64 strings."""
+    frame_b64_list = []
+    for i, frame in enumerate(key_frames):
         try:
-            # --- 1. Transkripce ---
-            try:
-                transcript = transcribe_video_file(video_path)
-                if not isinstance(transcript, str):
-                    transcript = str(transcript) if transcript is not None else ""
-            except Exception as e:
-                transcript = ""
-                logger.error(f"Transcription failed for {filename}: {e}")
-            all_transcripts[filename] = transcript
-
-            # --- 2. Extrakce klíčových snímků ---
-            try:
-                key_frame_arrays = extract_key_frames(video_path, frame_limit=8)
-                if not key_frame_arrays or not isinstance(key_frame_arrays, (list, tuple)):
-                    raise ValueError("No key frames returned")
-            except Exception as e:
-                error_msg = f"Frame extraction failed: {e}"
-                logger.error(f"{error_msg} for {filename}")
-                consolidated_tabular_output[filename] = {"error": error_msg}
-                all_summaries[filename] = ""
-                continue
-
-            # --- 3. Převod snímků na base64 ---
-            frame_b64_list = []
-            for i, frame in enumerate(key_frame_arrays):
-                try:
-                    if isinstance(frame, np.ndarray):
-                        if frame.size == 0:
-                            continue
-                        if frame.ndim == 3 and frame.shape[2] == 3:
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        else:
-                            frame_rgb = frame
-                        pil_image = Image.fromarray(frame_rgb.astype('uint8'), 'RGB')
-                    elif hasattr(frame, 'save'):
-                        pil_image = frame
-                    else:
-                        logger.warning(f"Unsupported frame type {type(frame)} in {filename}, skipping frame {i}")
-                        continue
-
-                    buffered = io.BytesIO()
-                    pil_image.save(buffered, format="JPEG")
-                    frame_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                    frame_b64_list.append(frame_b64)
-                except Exception as e:
-                    logger.warning(f"Failed to process frame {i} in {filename}: {e}")
-                    continue
-
-            if not frame_b64_list:
-                error_msg = "No valid frames could be processed."
-                consolidated_tabular_output[filename] = {"error": error_msg}
-                all_summaries[filename] = ""
-                continue
-
-            # --- 4. Generování shrnutí ---
-            summary_prompt = (
-                "You are an expert video analyst with deep knowledge in multimodal understanding (audio + visual). "
-                "Your task is to produce an exceptionally detailed, comprehensive, and structured summary of the provided file. "
-                "Use BOTH the full transcript AND the key visual frames to create a rich, insightful analysis. "
-                "Do NOT be brief. Write a long, thorough summary (at least 300–500 words).\n\n"
-                f"Transcript:\n{transcript}"
-            )
-
-            try:
-                video_summary = extract_image_features_with_llm(frame_b64_list, prompt=summary_prompt, feature_gen=True)
-                if not isinstance(video_summary, str):
-                    video_summary = str(video_summary) if video_summary is not None else ""
-            except Exception as e:
-                video_summary = f"[ERROR: Summary generation failed: {e}]"
-                logger.error(f"LLM summarization failed for {filename}: {e}")
-
-            all_summaries[filename] = video_summary
-
-        finally:
-            if temp_summary_path and os.path.exists(temp_summary_path):
-                try:
-                    os.remove(temp_summary_path)
-                except Exception:
-                    pass
-
-    # === 6. Společná textová analýza všech summaries ===
-    summary_files = []
-    os.makedirs('uploads', exist_ok=True)
-    for filename, summary_text in all_summaries.items():
-        temp_summary_path = os.path.join('uploads', f"summary_{os.path.splitext(filename)[0]}.txt")
-        with open(temp_summary_path, 'w', encoding='utf-8') as f:
-            f.write(summary_text)
-        summary_files.append(temp_summary_path)
-
-    try:
-        multi_video_result = process_text_files(summary_files, output_formats, description)
-
-        for summary_path in summary_files:
-            summary_filename = os.path.basename(summary_path)
-            video_name = summary_filename.replace("summary_", "").replace(".txt", "")
-            if summary_filename in multi_video_result.get('tabular_output', {}):
-                consolidated_tabular_output[video_name] = multi_video_result['tabular_output'][summary_filename]
+            if isinstance(frame, np.ndarray):
+                if frame.size == 0: continue
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            elif hasattr(frame, 'save'):
+                pil_image = frame
             else:
-                consolidated_tabular_output[video_name] = {"error": "No structured data returned"}
+                logger.warning(f"Unsupported frame type {type(frame)} in {filename}, skipping frame {i}")
+                continue
 
-        feature_spec_from_text = multi_video_result.get('feature_specification')
+            buffered = io.BytesIO()
+            pil_image.save(buffered, format="JPEG")
+            frame_b64_list.append(base64.b64encode(buffered.getvalue()).decode('utf-8'))
+        except Exception as e:
+            logger.warning(f"Failed to process frame {i} in {filename}: {e}")
+    return frame_b64_list
+
+
+def _process_single_video(video_path: str) -> Dict[str, Any]:
+    """Processes one video file to get its transcript and summary."""
+    filename = os.path.basename(video_path)
+    result = {'filename': filename, 'transcript': "", 'summary': "", 'error': None}
+    try:
+        result['transcript'] = transcribe_video_file(video_path)
+        key_frames = extract_key_frames(video_path, frame_limit=KEY_FRAME_LIMIT)
+        if not key_frames: raise ValueError("No key frames extracted.")
+
+        frame_b64_list = _convert_frames_to_base64(key_frames, filename)
+        if not frame_b64_list: raise ValueError("No valid frames could be processed.")
+
+        summary_prompt = SUMMARY_PROMPT_TEMPLATE.format(transcript=result['transcript'])
+
+        summary_response = extract_image_features_with_llm(frame_b64_list, prompt=summary_prompt, feature_gen=True)
+
+        if summary_response and isinstance(summary_response, list):
+            result['summary'] = str(summary_response[0])
+        else:
+            result['summary'] = "[ERROR: Invalid or empty summary response]"
 
     except Exception as e:
-        logger.error(f"Text analysis failed: {e}")
-        for filename in all_summaries.keys():
-            consolidated_tabular_output[filename] = {"error": f"Text analysis failed: {e}"}
+        logger.error(f"Failed to process video {filename}: {e}")
+        result['error'] = str(e)
+    return result
 
-    # === 7. Generování výstupních formátů ===
-    output_data = {}
-    valid_formats = {'json', 'csv', 'xlsx', 'xml'}
-    output_formats = [fmt for fmt in output_formats if fmt in valid_formats] or ['json']
 
-    for fmt in output_formats:
-        try:
-            if fmt == 'json':
-                output_data['json'] = json.dumps(consolidated_tabular_output, ensure_ascii=False, indent=2)
-            elif consolidated_tabular_output:
-                df = pd.DataFrame.from_dict(consolidated_tabular_output, orient='index')
-                if not df.empty:
-                    df = df.applymap(lambda x: x[0] if isinstance(x, list) and len(x) == 1 else x)
+def _analyze_video_summaries(summaries: Dict[str, str], output_formats: List[str], description: str) -> Dict:
+    """Performs text analysis on video summaries and returns structured data."""
+    temp_summary_files = []
+    os.makedirs('uploads', exist_ok=True)
+    try:
+        for filename, summary_text in summaries.items():
+            temp_path = os.path.join('uploads', f"summary_{os.path.splitext(filename)[0]}.txt")
+            with open(temp_path, 'w', encoding='utf-8') as f: f.write(summary_text)
+            temp_summary_files.append(temp_path)
 
-                if fmt == 'csv':
-                    output_data['csv'] = df.to_csv()
-                elif fmt == 'xlsx':
-                    xlsx_buffer = BytesIO()
-                    df.to_excel(xlsx_buffer, index=True)
-                    xlsx_buffer.seek(0)
-                    output_data['xlsx'] = xlsx_buffer.read()
-                elif fmt == 'xml':
-                    output_data['xml'] = df.to_xml(root_name='dataset')
-        except Exception as e:
-            logger.error(f"Output format '{fmt}' generation failed: {e}")
-            if fmt == 'json':
-                output_data['json'] = json.dumps({"error": f"JSON output failed: {str(e)}"}, indent=2)
-            else:
-                output_data[fmt] = f"<error>Export to {fmt} failed: {e}</error>"
+        text_analysis = process_text_files(temp_summary_files, output_formats, description)
+        tabular_output = {}
+        analysis_data = text_analysis.get('tabular_output', {})
+        for path in temp_summary_files:
+            original_fname = next(
+                (fname for fname in summaries if os.path.splitext(fname)[0] in os.path.basename(path)), None)
+            if original_fname:
+                tabular_output[original_fname] = analysis_data.get(os.path.basename(path),
+                                                                   {"error": "No data returned"})
+        return {'tabular_output': tabular_output, 'feature_specification': text_analysis.get('feature_specification')}
+    finally:
+        for f in temp_summary_files:
+            if os.path.exists(f): os.remove(f)
+
+
+def process_video_files(file_paths: List[str], output_formats: Optional[List[str]] = None,
+                        description: Optional[str] = None) -> dict:
+    logger.info("Processing video files...")
+    if not file_paths:
+        return {'status': 'error', 'error': 'file_paths must be non-empty', 'type': 'video'}
+
+    final_formats = [fmt.lower() for fmt in (output_formats or []) if fmt in VALID_OUTPUT_FORMATS] or ['json']
+    all_transcripts, all_summaries, consolidated_output = {}, {}, {}
+
+    for path in file_paths:
+        if not (isinstance(path, str) and os.path.isfile(path)):
+            fname = os.path.basename(str(path)) if isinstance(path, str) else "unknown"
+            consolidated_output[fname] = {"error": f"Invalid or non-existent path: {path}"}
+            continue
+
+        result = _process_single_video(path)
+        all_transcripts[result['filename']] = result['transcript']
+        all_summaries[result['filename']] = result['summary']
+        if result['error']: consolidated_output[result['filename']] = {"error": result['error']}
+
+    valid_summaries = {k: v for k, v in all_summaries.items() if v and not v.startswith('[ERROR')}
+    feature_spec = None
+    if valid_summaries:
+        analysis_result = _analyze_video_summaries(valid_summaries, final_formats, description)
+        consolidated_output.update(analysis_result.get('tabular_output', {}))
+        feature_spec = analysis_result.get('feature_specification')
+
+    output_data = _format_outputs(consolidated_output, final_formats)
 
     return {
-        'status': 'processed',
-        'type': 'video',
-        'original_files': list(file_paths),
-        'output_formats': output_formats,
-        'description': description or "",
-        'tabular_output': consolidated_tabular_output,
-        'outputs': output_data,
-        'feature_specification': feature_spec_from_text,
-        'transcripts': all_transcripts,
-        'summaries': all_summaries
+        'status': 'processed', 'type': 'video', 'original_files': file_paths,
+        'output_formats': final_formats, 'description': description or "",
+        'tabular_output': consolidated_output, 'outputs': output_data,
+        'feature_specification': feature_spec,
+        'transcripts': all_transcripts, 'summaries': all_summaries
     }
 
 
-def select_representative_images(image_arrays, sample_size=20):
-    """
-    Select a representative sample of images from the dataset.
-    Uses random sampling if the dataset is larger than sample_size.
-    Returns a list of numpy arrays.
-    """
-    if len(image_arrays) <= sample_size:
-        return image_arrays
-    return random.sample(image_arrays, sample_size)
+# --- 8. Miscellaneous Utilities ---
+
+def select_representative_images(items: List[Any], sample_size: int) -> List[Any]:
+    """Selects a random sample from a list of items."""
+    if len(items) <= sample_size:
+        return items
+    return random.sample(items, sample_size)
 
 
-def extract_key_frames(video_path, frame_limit=8, sharpness_threshold=100.0):
+def extract_key_frames(video_path: str, frame_limit: int = 8, sharpness_threshold: float = 100.0) -> List[np.ndarray]:
+    """Extracts distinct and sharp key frames from a video."""
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
-        print(f"Error: Could not open video: {video_path}")
+        logger.error(f"Could not open video: {video_path}")
         return []
 
-    candidates = []
-    frame_skip = 15
-    frame_count = 0
-    prev_gray_frame = None
-
+    candidates, frame_skip, frame_count, prev_gray = [], 15, 0, None
     while True:
         is_read, frame = cap.read()
-        if not is_read:
-            break
+        if not is_read: break
 
         frame_count += 1
-        if frame_count % frame_skip != 0:
-            continue
+        if frame_count % frame_skip != 0: continue
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        sharpness_score = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
+        if cv2.Laplacian(gray_frame, cv2.CV_64F).var() < sharpness_threshold: continue
 
-        if sharpness_score < sharpness_threshold:
-            continue
-
-        change_score = 0
-        if prev_gray_frame is not None:
-            diff = cv2.absdiff(prev_gray_frame, gray_frame)
-            change_score = int(diff.sum())
-
+        change_score = cv2.absdiff(prev_gray, gray_frame).sum() if prev_gray is not None else 0
         candidates.append((change_score, frame))
-        prev_gray_frame = gray_frame
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-
-    top_frames_data = candidates[:frame_limit]
-
-    key_frames = [frame for score, frame in top_frames_data]
+        prev_gray = gray_frame
 
     cap.release()
-    return key_frames
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [frame for score, frame in candidates[:frame_limit]]
 
-def resize_with_padding(image, target_size=(1024, 1024), background_color="black"):
-    image.thumbnail(target_size)
 
-    new_image = Image.new("RGB", target_size, background_color)
+def create_collage(image_arrays: List[np.ndarray], collage_width: int = 1024) -> Optional[Image.Image]:
+    """Creates a horizontal collage from a list of image arrays."""
+    if not image_arrays: return None
 
-    left = (target_size[0] - image.width) // 2
-    top = (target_size[1] - image.height) // 2
+    target_height = collage_width // len(image_arrays) if len(image_arrays) > 0 else 0
+    if target_height == 0: return None
 
-    new_image.paste(image, (left, top))
+    pil_images = []
+    total_width = 0
+    for frame in image_arrays:
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        ratio = target_height / img.height
+        new_width = int(img.width * ratio)
+        img = img.resize((new_width, target_height), Image.LANCZOS)
+        pil_images.append(img)
+        total_width += new_width
 
-    return new_image
+    collage = Image.new('RGB', (total_width, target_height))
+    current_x = 0
+    for img in pil_images:
+        collage.paste(img, (current_x, 0))
+        current_x += img.width
+    return collage
+
+
+# --- 9. Prompt Templates ---
 
 # Universal prompt template for text feature extraction
 prompt_template = Template("""
@@ -601,7 +528,6 @@ prompt_template = Template("""
     }
 """)
 
-
 # Universal prompt template for image feature discovery
 image_prompt_template = Template("""
 {
@@ -641,31 +567,3 @@ image_prompt_template = Template("""
     }
 }
 """)
-
-
-def create_collage(image_arrays, collage_width=1024):
-    if not image_arrays:
-        return None
-
-    target_height = collage_width // len(image_arrays)
-    pil_images = []
-    total_width = 0
-    for frame in image_arrays:
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(img_rgb)
-
-        ratio = target_height / img.height
-        new_width = int(img.width * ratio)
-        img = img.resize((new_width, target_height), Image.LANCZOS)
-
-        pil_images.append(img)
-        total_width += new_width
-
-    collage = Image.new('RGB', (total_width, target_height))
-
-    current_x = 0
-    for img in pil_images:
-        collage.paste(img, (current_x, 0))
-        current_x += img.width
-
-    return collage
