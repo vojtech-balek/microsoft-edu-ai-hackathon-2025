@@ -1,7 +1,0 @@
-node_modules/
-dist/
-.vite/
-.cache/
-.env
-*.local
-.DS_Store
