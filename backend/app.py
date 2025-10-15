@@ -7,9 +7,10 @@ app = Flask(__name__)
 
 # Allowed extensions for each type
 ALLOWED_EXTENSIONS = {
-    'text': {'pdf'},
+    'text': {'pdf', 'txt'},
     'image': {'png', 'jpg', 'jpeg'},
-    'video': {'mp4', 'avi', 'mov', 'mkv'}
+    'video': {'mp4', 'avi', 'mov', 'mkv'},
+    'zip': {'zip'}
 }
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
