@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import PyPDF2
 import logging
 from typing import List, Optional, Any
+import zipfile
+import shutil
 
 from .speech_service import transcribe_video_file
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +29,57 @@ def process_files(file_paths, file_type, output_formats=None, description=None):
     if output_formats is None:
         output_formats = []
     result = None
+
+    if file_type == 'zip':
+        zip_path = file_paths[0]
+        temp_dir = os.path.join('uploads', f"temp_unzip_{int(time.time())}")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+
+            extracted_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for name in files:
+                    if not name.startswith('__MACOSX') and not name.startswith('.'):
+                        extracted_files.append(os.path.join(root, name))
+
+            if not extracted_files:
+                return {'status': 'error', 'message': 'The zip file is empty.'}
+
+            inner_file_types = set()
+            for f_path in extracted_files:
+                ext = os.path.splitext(f_path)[1].lower().replace('.', '')
+                if ext in {'pdf', 'txt'}:
+                    inner_file_types.add('text')
+                elif ext in {'png', 'jpg', 'jpeg'}:
+                    inner_file_types.add('image')
+                elif ext in {'mp4', 'avi', 'mov', 'mkv'}:
+                    inner_file_types.add('video')
+
+            if len(inner_file_types) > 1:
+                return {'status': 'error',
+                        'message': f'Zip file contains multiple file types: {list(inner_file_types)}'}
+            if not inner_file_types:
+                return {'status': 'error', 'message': 'No supported file types found in the zip file.'}
+
+            actual_file_type = inner_file_types.pop()
+
+            print(f"Processing {len(extracted_files)} files of type '{actual_file_type}' from zip archive...")
+
+            if actual_file_type == 'text':
+                return process_text_files(extracted_files, output_formats, description)
+            elif actual_file_type == 'image':
+                return process_image_files(extracted_files, output_formats, description)
+            elif actual_file_type == 'video':
+                return process_video_files(extracted_files, output_formats, description)
+            else:
+                return {'status': 'error', 'message': f'File type "{actual_file_type}" found in zip is not supported.'}
+
+        finally:
+            shutil.rmtree(temp_dir)
+
     if file_type == 'text':
         result = process_text_files(file_paths, output_formats, description)
     elif file_type == 'image':
@@ -75,21 +128,16 @@ def process_text_files(file_paths, output_formats, description, target=None):
     prompt = prompt_template.substitute(name=dataset_name, description=description or "", target=target, examples=examples_str)
     # Step 4: Feature extraction using LLM (timed)
     feature_spec = extract_text_features_with_llm(rep_texts, prompt=prompt)
-    feature_prompt_time = time.time() - t0
-    print(f"{feature_prompt_time = }")
     feature_prompt = str(feature_spec[0])
     # Step 5: Feature generation for all texts (parallel, timed)
     def extract_single(text):
         return extract_text_features_with_llm([text], prompt=feature_prompt, feature_gen=True)
-    t1 = time.time()
     all_features = []
     with ThreadPoolExecutor() as executor:
         futures = [executor.submit(extract_single, text) for text in texts_list]
         for future in as_completed(futures):
             all_features.append(future.result())
     all_features = [future.result() for future in futures]
-    feature_value_time = time.time() - t1
-    print(f"{feature_value_time = }")
     # Step 6: Output tabular dataset
     tabular_output = {}
     for filename, features in zip(extracted_texts.keys(), all_features):
