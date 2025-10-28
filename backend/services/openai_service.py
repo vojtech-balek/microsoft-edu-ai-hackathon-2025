@@ -37,11 +37,10 @@ def extract_image_features_with_llm(image_base64_list, prompt=None, deployment_n
             deployment_name = os.getenv("AZURE_OPENAI_GPT41_DEPLOYMENT_NAME")
         max_retries = 5
         backoff = 2
-        if not feature_gen:
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-            })
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+        })
         for attempt in range(max_retries):
             try:
                 response = client.chat.completions.create(
