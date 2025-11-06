@@ -19,6 +19,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 def allowed_file(filename, allowed_exts):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_exts
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify(status='ok'), 200
+    
 @app.route('/upload', methods=['POST'])
 def upload_files():
     files = request.files.getlist('files')
